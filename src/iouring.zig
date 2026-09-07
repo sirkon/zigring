@@ -5,6 +5,7 @@ const posix = std.posix;
 const BufferPool = @import("provided_buffer.zig").ProvidedBufferPool;
 
 pub const page_size: usize = 4096;
+pub const fireAndForgetTaskIdx: u64 = std.math.maxInt(u64);
 
 pub const BufferClass = enum(u16) {
     tiny = 0, // 128 B
@@ -27,6 +28,45 @@ pub const BufferClass = enum(u16) {
     }
 };
 
+/// Flags for SQE.
+pub const TaskFlags = packed struct(u8) {
+    const Self = @This();
+
+    /// IOSQE_FIXED_FILE (1 << 0): Использовать заранее зарегистрированные файлы (registered fds) вместо обычных
+    FixedFile: bool = false,
+
+    /// IOSQE_IODONE_HO_WO (1 << 1): Старый внутренний флаг ядра. Не используется в пользовательском коде (можно оставить false)
+    _iosqe_idone_ho_wo: bool = false,
+
+    /// IOSQE_IO_DRAIN (1 << 2): Ждать завершения ВСЕХ предыдущих задач в кольце перед тем, как начать эту
+    Drain: bool = false,
+
+    /// IOSQE_IO_LINK (1 << 3): Связать эту задачу со следующей. Тот самый флаг, который вам нужен для таймера!
+    Link: bool = false,
+
+    /// IOSQE_IO_HARDLINK (1 << 4): Похож на io_link, но цепочка не рвется, даже если предыдущая задача упала с ошибкой
+    HardLink: bool = false,
+
+    /// IOSQE_ASYNC (1 << 5): Принудительно запустить задачу асинхронно в воркерах ядра (io-wq), даже если она не блокирующая
+    ForceAsync: bool = false,
+
+    /// IOSQE_BUFFER_SELECT (1 << 6): Использовать автоматический выбор буфера из пула ядра (для IORING_OP.PROVIDE_BUFFERS)
+    BufferSelect: bool = false,
+
+    /// IOSQE_CQE_SKIP_SUCCESS (1 << 7): Не генерировать CQE в очереди завершения, если задача выполнилась успешно
+    SkipSuccess: bool = false,
+
+    pub fn flags(self: Self) u8 {
+        return @bitCast(self);
+    }
+
+    pub fn expectNext() Self {
+        return .{
+            .Link = true,
+        };
+    }
+};
+
 /// CQE is a type returned by popCQE method.
 pub const CQE = struct {
     taskIdx: u64,
@@ -34,10 +74,20 @@ pub const CQE = struct {
     bid: u16,
     hasBuffer: bool,
     hasMore: bool,
+
+    /// Return errno for given res.
+    pub inline fn errno(self: CQE) posix.UnexpectedError!void {
+        if (self.res >= 0) {
+            return;
+        }
+
+        const resU: usize = @bitCast(@as(i64, self.res));
+        return std.posix.unexpectedErrno(linux.errno(resU));
+    }
 };
 
 /// A wrapper for io_uring ring with kernel poller.
-pub const ZigRing = struct {
+pub const Ring = struct {
     const Self = @This(); // Exact type mapping verified
 
     fd: posix.fd_t,
@@ -61,7 +111,7 @@ pub const ZigRing = struct {
     bufPools: [@typeInfo(BufferClass).@"enum".fields.len]BufferPool =
         [_]BufferPool{undefined} ** @typeInfo(BufferClass).@"enum".fields.len,
 
-    /// Creates and initializes new a new ring.
+    /// Creates and initializes a new ring.
     pub fn init(queueDepth: u32, attachFd: ?posix.fd_t) !Self {
         if (@popCount(queueDepth) != 1) {
             return error.ZigRingRequiresDepthPowOf2;
@@ -206,7 +256,7 @@ pub const ZigRing = struct {
             return;
         }
 
-        return linux.errno(-res);
+        return posix.unexpectedErrno(linux.errno(-res));
     }
 
     pub inline fn pushWrite(
@@ -215,6 +265,7 @@ pub const ZigRing = struct {
         taskIdx: u64,
         dataPtr: [*]const u8,
         len: usize,
+        flags: TaskFlags,
     ) !void {
         const targetSlot = try self.getOpSlot();
         const sqe = targetSlot.entry;
@@ -224,6 +275,28 @@ pub const ZigRing = struct {
         sqe.addr = @intFromPtr(dataPtr);
         sqe.len = @intCast(len);
         sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    pub inline fn pushSend(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.SEND;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
@@ -233,6 +306,7 @@ pub const ZigRing = struct {
         targetFd: posix.fd_t,
         taskIdx: u64,
         size: BufferClass,
+        flags: TaskFlags,
     ) !void {
         const bgid = @intFromEnum(size);
         if (self.bufPools[bgid].isInactive()) {
@@ -246,7 +320,7 @@ pub const ZigRing = struct {
         sqe.opcode = linux.IORING_OP.READ;
         sqe.fd = targetFd;
         sqe.len = size.size();
-        sqe.flags = linux.IOSQE_BUFFER_SELECT;
+        sqe.flags = linux.IOSQE_BUFFER_SELECT | flags.flags();
         sqe.buf_index = bgid;
         sqe.user_data = taskIdx;
 
@@ -258,6 +332,7 @@ pub const ZigRing = struct {
         targetFd: posix.fd_t,
         taskIdx: u64,
         size: BufferClass,
+        flags: TaskFlags,
     ) !void {
         const bgid = @intFromEnum(size);
         if (self.bufPools[bgid].isInactive()) {
@@ -271,7 +346,7 @@ pub const ZigRing = struct {
         sqe.opcode = linux.IORING_OP.RECV;
         sqe.fd = targetFd;
         sqe.len = size.size();
-        sqe.flags = linux.IOSQE_BUFFER_SELECT;
+        sqe.flags = linux.IOSQE_BUFFER_SELECT | flags.flags();
         sqe.buf_index = bgid;
         sqe.user_data = taskIdx;
 
@@ -283,6 +358,7 @@ pub const ZigRing = struct {
         targetFd: posix.fd_t,
         taskIdx: u64,
         size: BufferClass,
+        flags: TaskFlags,
     ) !void {
         const bgid = @intFromEnum(size);
         if (self.bufPools[bgid].isInactive()) {
@@ -295,7 +371,7 @@ pub const ZigRing = struct {
 
         sqe.opcode = linux.IORING_OP.RECV;
         sqe.fd = targetFd;
-        sqe.flags = linux.IOSQE_BUFFER_SELECT;
+        sqe.flags = linux.IOSQE_BUFFER_SELECT | flags.flags();
         sqe.buf_index = bgid;
         sqe.user_data = taskIdx;
         sqe.ioprio = linux.IORING_RECV_MULTISHOT;
@@ -310,6 +386,7 @@ pub const ZigRing = struct {
         taskIdx: u64,
         baseDirFd: posix.fd_t, // Descriptor of the root logs folder, e.g. opened at startup with AT_FDCWD
         subPath: [*:0]const u8, // Name of the shard/session subfolder, e.g. "shard_42"
+        flags: TaskFlags,
     ) !void {
         const targetSlot = try self.getOpSlot();
         const sqe = targetSlot.entry;
@@ -329,7 +406,7 @@ pub const ZigRing = struct {
         sqe.user_data = taskIdx;
 
         // Force the operation into the background io-wq pool
-        sqe.flags = linux.IOSQE_ASYNC;
+        sqe.flags = linux.IOSQE_ASYNC | flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
@@ -341,7 +418,8 @@ pub const ZigRing = struct {
         taskIdx: u64,
         dirFd: posix.fd_t, // Descriptor of the folder obtained from the previous pushOpenDir step
         fileName: [*:0]const u8, // File name, e.g. "session_123.wal"
-        flags: linux.O,
+        opts: linux.O,
+        flags: TaskFlags,
     ) !void {
         const targetSlot = try self.getOpSlot();
         const sqe = targetSlot.entry;
@@ -353,16 +431,16 @@ pub const ZigRing = struct {
 
         // Flags for ultra-perf: Read/Write + Create if missing + DIRECT I/O (bypassing the OS cache)
         // In Zig master, posix.O is force-cast to u32 via bitCast
-        var safeFlags = flags;
-        safeFlags.CLOEXEC = true;
-        sqe.rw_flags = @bitCast(safeFlags);
+        var safeOpts = opts;
+        safeOpts.CLOEXEC = true;
+        sqe.rw_flags = @bitCast(safeOpts);
 
         // Access mode for the created file (standard 0o644)
         sqe.len = 0o644;
         sqe.user_data = taskIdx;
 
         // Keep SQPOLL from going to sleep: offload to io-wq workers
-        sqe.flags = linux.IOSQE_ASYNC;
+        sqe.flags = linux.IOSQE_ASYNC | flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
@@ -371,6 +449,7 @@ pub const ZigRing = struct {
         self: *Self,
         taskIdx: u64,
         targetFd: posix.fd_t,
+        flags: TaskFlags,
     ) !void {
         const targetSlot = try self.getOpSlot();
         const sqe = targetSlot.entry;
@@ -378,7 +457,7 @@ pub const ZigRing = struct {
         sqe.opcode = linux.IORING_OP.CLOSE;
         sqe.fd = targetFd;
         sqe.user_data = taskIdx;
-        sqe.flags = linux.IOSQE_ASYNC;
+        sqe.flags = linux.IOSQE_ASYNC | flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
@@ -389,6 +468,7 @@ pub const ZigRing = struct {
         self: *Self,
         listenFd: posix.fd_t,
         taskIdx: u64,
+        flags: TaskFlags,
     ) !void {
         const targetSlot = try self.getOpSlot();
         const sqe = targetSlot.entry;
@@ -401,12 +481,32 @@ pub const ZigRing = struct {
         // the kernel just hands out socket descriptors; leave it zero (already zeroed)
 
         // Enable the flag that auto-creates client sockets with O_CLOEXEC
-        sqe.rw_flags = @bitCast(posix.SOCK.CLOEXEC);
+        sqe.rw_flags = posix.SOCK.CLOEXEC;
 
         // Arm the MULTISHOT mode in ioprio!
         sqe.ioprio = linux.IORING_ACCEPT_MULTISHOT;
 
         sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Run accept to catch incoming connections.
+    pub inline fn pushAccept(
+        self: *Self,
+        listenFd: posix.fd_t,
+        taskIdx: u64,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.ACCEPT;
+        sqe.fd = listenFd;
+        sqe.rw_flags = posix.SOCK.CLOEXEC;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
@@ -419,6 +519,7 @@ pub const ZigRing = struct {
         baseDirFd: posix.fd_t, // Our saved descriptor of the single logs folder
         oldName: [*:0]const u8, // E.g. "session_42.wal.tmp"
         newName: [*:0]const u8, // E.g. "session_42.wal"
+        flags: TaskFlags,
     ) !void {
         const targetSlot = try self.getOpSlot();
         const sqe = targetSlot.entry;
@@ -440,16 +541,20 @@ pub const ZigRing = struct {
         sqe.user_data = taskIdx;
 
         // Force the operation into kernel io-wq workers, since RENAME locks VFS metadata
-        sqe.flags = linux.IOSQE_ASYNC;
+        sqe.flags = linux.IOSQE_ASYNC | flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
+    /// Asynchronously binds a socket to a local address.
+    /// WARNING: targetSockAddr must remain valid in memory until the operation completes!
     pub inline fn pushBind(
         self: *Self,
         socketFd: posix.fd_t,
         taskIdx: u64,
         address: *const std.Io.net.IpAddress,
+        targetSockAddr: *posix.sockaddr.storage, // Передаем указатель на долгоживущую структуру!
+        flags: TaskFlags,
     ) !void {
         const targetSlot = try self.getOpSlot();
         const sqe = targetSlot.entry;
@@ -457,34 +562,38 @@ pub const ZigRing = struct {
         sqe.opcode = linux.IORING_OP.BIND;
         sqe.fd = socketFd;
         sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
 
-        var sockAddr: posix.sockaddr = undefined;
-        var addrLen: posix.socklen_t = 0;
-        sqe.addr =
-            switch (address) {
-                .ip4 => |ip4| {
-                    var in_addr = posix.sockaddr.in{
-                        .family = posix.AF.INET,
-                        // Need big endian for the network.
-                        .port = std.mem.nativeToBig(u16, ip4.port),
-                        // Copy all bytes.
-                        .addr = @bitCast(ip4.bytes),
-                    };
-                    @memcpy(std.mem.asBytes(&sockAddr)[0..@sizeOf(posix.sockaddr.in)], std.mem.asBytes(&in_addr));
-                    addrLen = @sizeOf(posix.sockaddr.in); //
-                },
-                .ip6 => |ip6| {
-                    var in6_addr = posix.sockaddr.in6{
-                        .family = posix.AF.INET6,
-                        .port = std.mem.nativeToBig(u16, ip6.port),
-                        .flowinfo = ip6.flow,
-                        .addr = ip6.bytes,
-                        .scope_id = 0,
-                    };
-                    @memcpy(std.mem.asBytes(&sockAddr)[0..@sizeOf(posix.sockaddr.in6)], std.mem.asBytes(&in6_addr));
-                    addrLen = @sizeOf(posix.sockaddr.in6);
-                },
-            };
+        // Передаем адрес структуры в sqe.addr (ядро хочет u64)
+        sqe.addr = @intFromPtr(targetSockAddr);
+
+        // Наполняем структуру данными в зависимости от типа IP
+        switch (address.*) {
+            .ip4 => |ip4| {
+                const inAddr = posix.sockaddr.in{
+                    .family = posix.AF.INET,
+                    .port = std.mem.nativeToBig(u16, ip4.port),
+                    .addr = @bitCast(ip4.bytes),
+                };
+                // Копируем прямо в переданную структуру
+                @memcpy(std.mem.asBytes(targetSockAddr)[0..@sizeOf(posix.sockaddr.in)], std.mem.asBytes(&inAddr));
+
+                // В io_uring размер структуры передается в поле sqe.off (оно же союзное с addr2)
+                sqe.off = @sizeOf(posix.sockaddr.in);
+            },
+            .ip6 => |ip6| {
+                const in6Addr = posix.sockaddr.in6{
+                    .family = posix.AF.INET6,
+                    .port = std.mem.nativeToBig(u16, ip6.port),
+                    .flowinfo = ip6.flow,
+                    .addr = ip6.bytes,
+                    .scope_id = 0,
+                };
+                @memcpy(std.mem.asBytes(targetSockAddr)[0..@sizeOf(posix.sockaddr.in6)], std.mem.asBytes(&in6Addr));
+
+                sqe.off = @sizeOf(posix.sockaddr.in6);
+            },
+        }
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
@@ -494,6 +603,7 @@ pub const ZigRing = struct {
         socketFd: posix.fd_t,
         taskIdx: u64,
         backlog: u32,
+        flags: TaskFlags,
     ) !void {
         const targetSlot = try self.getOpSlot();
         const sqe = targetSlot.entry;
@@ -502,6 +612,7 @@ pub const ZigRing = struct {
         sqe.fd = socketFd;
         sqe.len = backlog;
         sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
@@ -513,6 +624,7 @@ pub const ZigRing = struct {
         targetRingFd: posix.fd_t, // fd of the ring belonging to the sleeping thread
         taskIdx: u64,
         msgResult: u32, // Custom message type/signal (will go into cqe.res)
+        flags: TaskFlags,
     ) !void {
         const targetSlot = try self.getOpSlot();
         const sqe = targetSlot.entry;
@@ -520,7 +632,7 @@ pub const ZigRing = struct {
         // getOpSlot already did @memset to 0, only fill the flat meaningful Linux ABI fields
         sqe.opcode = linux.IORING_OP.MSG_RING;
         sqe.fd = targetRingFd; // Target ring descriptor
-        sqe.flags = linux.IOSQE_CQE_SKIP_SUCCESS;
+        sqe.flags = linux.IOSQE_CQE_SKIP_SUCCESS | flags.flags();
 
         // Map data: len will go to cqe.res, off will go to cqe.user_data on the receiver side
         sqe.len = msgResult;
@@ -529,6 +641,74 @@ pub const ZigRing = struct {
         // We don't typically care about the response to the send operation itself in our own CQE,
         // so we leave sqe.user_data at zero (already zeroed in getOpSlot).
         // The task will execute on the current CPU instantly without blocking.
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Asynchronous timer. The thread will wake up and produce a CQE
+    /// when the specified time has elapsed (seconds + nanoseconds).
+    /// timespecPtr must remain valid in memory while the timer is ticking!
+    /// Beware, you should be really careful with skipSuccess in flags,
+    /// since it will lead to timespecPtr leak if it is not static.
+    pub inline fn pushTimeout(
+        self: *Self,
+        taskIdx: u64,
+        timespecPtr: *const linux.kernel_timespec,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.TIMEOUT;
+        sqe.fd = -1; // No file descriptor needed for timers, write -1
+
+        // Pass the pointer to the time structure
+        sqe.addr = @intFromPtr(timespecPtr);
+
+        // Timer task will really wait for the timer to stop.
+        sqe.len = 0;
+
+        // Timer flags: 0 means relative time (countdown starts from the moment of push).
+        // If absolute time is needed, set linux.IORING_TIMEOUT_ABS.
+        sqe.rw_flags = linux.IORING_TIMEOUT_ETIME_SUCCESS;
+        sqe.flags = flags.flags();
+
+        sqe.user_data = taskIdx;
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Attaches a timeout to the previously submitted operation in the chain.
+    /// If the previous operation does not complete within timespecPtr, it will be canceled.
+    /// timespecPtr must remain valid in memory while the timer is ticking!
+    /// Beware, you should be really careful with skipSuccess in flags,
+    /// since it will lead to timespecPtr leak if it is not static.
+    pub inline fn pushTimeoutForOp(
+        self: *Self,
+        timespecPtr: *const linux.kernel_timespec,
+        taskIdx: u64,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        // Use LINK_TIMEOUT to bind to the previous SQE in the queue
+        sqe.opcode = linux.IORING_OP.LINK_TIMEOUT;
+        sqe.fd = -1; // No file descriptor needed for timers, write -1
+
+        // Pass the pointer to the time structure
+        sqe.addr = @intFromPtr(timespecPtr);
+
+        // For linked timeouts, len must always be set to 0
+        sqe.len = 0;
+
+        // Timer flags: using ETIME_SUCCESS so that a regular timeout is treated normally.
+        // rw_flags maps directly to timeout_flags in the flat SQE structure.
+        sqe.rw_flags = linux.IORING_TIMEOUT_ETIME_SUCCESS;
+        sqe.flags = flags.flags();
+
+        // Use the global constant for the timer instead of a custom taskIdx
+        sqe.user_data = taskIdx;
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
@@ -611,31 +791,102 @@ test "create and write file" {
     defer mgr.deinit();
 
     var ring = try mgr.acquireRing(128, 1);
-    try ring.pushOpenDir(1, 0, "/tmp");
+    try ring.pushOpenDir(1, 0, "/tmp", .{});
 
     var cqe = try wait(&ring);
     const dirFd = cqe.res;
 
-    try ring.pushOpenFile(1, dirFd, "file.txt", linux.O{ .CREAT = true, .ACCMODE = .WRONLY });
+    try ring.pushOpenFile(1, dirFd, "file.txt", linux.O{ .CREAT = true, .ACCMODE = .WRONLY }, .{});
     cqe = try wait(&ring);
     const fileFd = cqe.res;
 
-    try ring.pushWrite(fileFd, 1, "Hello World!\n", 13);
+    try ring.pushWrite(fileFd, 1, "Hello World!\n", 13, .{});
     cqe = try wait(&ring);
 
-    try ring.pushClose(1, fileFd);
+    try ring.pushClose(1, fileFd, .{});
     cqe = try wait(&ring);
+
+    // Now, need to check if the file was successfully written.
+    const io = std.testing.io;
+    var buffer: [256]u8 = undefined;
+
+    const content = try std.Io.Dir.readFile(std.Io.Dir.cwd(), io, "/tmp/file.txt", buffer[0..]);
+    try std.testing.expectEqualSlices(u8, "Hello World!\n", content);
 }
 
-fn wait(ring: *ZigRing) !CQE {
+test "create a server and wait for 1 second for incoming connections what will never happen" {
+    const Manager = @import("ring_manager.zig").WeightedRingManager;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var mgr = try Manager.init(arena.allocator(), 1);
+    defer mgr.deinit();
+
+    var ring = try mgr.acquireRing(128, 1);
+
+    const sockets = @import("sockets.zig");
+    const sockFd = try sockets.createServerSocket();
+    defer _ = linux.close(sockFd);
+
+    const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", 60006);
+
+    var sockAddr: std.posix.sockaddr.storage = undefined;
+    try ring.pushBind(sockFd, 1, &addr, &sockAddr, .{});
+    var cqe = try wait(&ring);
+
+    try ring.pushListen(sockFd, 1, 1, .{});
+    _ = try wait(&ring);
+
+    while (true) {
+        try ring.pushAccept(sockFd, 2, TaskFlags.expectNext());
+        const timerSpec = linux.kernel_timespec{
+            .sec = 1,
+            .nsec = 0,
+        };
+        try ring.pushTimeoutForOp(&timerSpec, 3, TaskFlags{ .SkipSuccess = true });
+
+        var needReroll = false;
+        for (0..2) |_| {
+            cqe = waitNoMatterWhat(&ring);
+            if (cqe.taskIdx != 2) {
+                continue;
+            }
+
+            if (cqe.res >= 0) {
+                std.debug.print("unexpected success: {}\n", .{cqe});
+                return error.UnexpectedSuccess;
+            }
+
+            const resU: usize = @bitCast(@as(i64, cqe.res));
+            switch (linux.errno(resU)) {
+                linux.E.CANCELED => return,
+                linux.E.AGAIN => {
+                    needReroll = true;
+                },
+                else => {
+                    std.debug.print("unexpected error {!} in {} \n", .{ cqe.errno(), cqe });
+                    try std.testing.expect(false);
+                },
+            }
+        }
+
+        if (!needReroll) {
+            break;
+        }
+    }
+}
+
+fn wait(ring: *Ring) !CQE {
     while (true) {
         const cqe = ring.popCQE() orelse continue;
 
-        if (cqe.res < 0) {
-            std.debug.print("{}", .{cqe});
-            return std.posix.unexpectedErrno(linux.errno(@intCast(-cqe.res)));
-        }
+        try cqe.errno();
+        return cqe;
+    }
+}
 
+fn waitNoMatterWhat(ring: *Ring) CQE {
+    while (true) {
+        const cqe = ring.popCQE() orelse continue;
         return cqe;
     }
 }

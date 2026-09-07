@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const Uring = @import("iouring.zig").ZigRing;
+const Uring = @import("iouring.zig").Ring;
 const pthread = @import("pthread.zig");
 
 pub const WeightedRingManager = struct {
