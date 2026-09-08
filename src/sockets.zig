@@ -2,6 +2,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 
+/// Creates a socket for serving.
 pub fn createServerSocket() !posix.fd_t {
     // 1. Создаем сокет. Вызов возвращает usize.
     const rc = linux.socket(

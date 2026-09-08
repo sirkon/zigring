@@ -7,7 +7,7 @@ const BufferPool = @import("provided_buffer.zig").ProvidedBufferPool;
 pub const page_size: usize = 4096;
 pub const fireAndForgetTaskIdx: u64 = std.math.maxInt(u64);
 
-pub const BufferClass = enum(u16) {
+pub const BufferSizeClass = enum(u16) {
     tiny = 0, // 128 B
     small = 1, // 512 B
     net = 2, // 2 KiB (Ideal for MTU / Ethernet frames)
@@ -16,7 +16,7 @@ pub const BufferClass = enum(u16) {
     huge = 5, // 64 KiB
 
     /// Returns the exact size of the class in bytes
-    pub inline fn size(self: BufferClass) u32 {
+    pub inline fn size(self: BufferSizeClass) u32 {
         return switch (self) {
             .tiny => 128,
             .small => 512,
@@ -56,11 +56,11 @@ pub const TaskFlags = packed struct(u8) {
     /// IOSQE_CQE_SKIP_SUCCESS (1 << 7): Не генерировать CQE в очереди завершения, если задача выполнилась успешно
     SkipSuccess: bool = false,
 
-    pub fn flags(self: Self) u8 {
+    pub inline fn flags(self: Self) u8 {
         return @bitCast(self);
     }
 
-    pub fn expectNext() Self {
+    pub inline fn expectNext() Self {
         return .{
             .Link = true,
         };
@@ -108,8 +108,8 @@ pub const Ring = struct {
     cqMask: u32,
     cqEntries: [*]linux.io_uring_cqe,
 
-    bufPools: [@typeInfo(BufferClass).@"enum".fields.len]BufferPool =
-        [_]BufferPool{undefined} ** @typeInfo(BufferClass).@"enum".fields.len,
+    bufPools: [@typeInfo(BufferSizeClass).@"enum".fields.len]BufferPool =
+        [_]BufferPool{undefined} ** @typeInfo(BufferSizeClass).@"enum".fields.len,
 
     /// Creates and initializes a new ring.
     pub fn init(queueDepth: u32, attachFd: ?posix.fd_t) !Self {
@@ -185,7 +185,7 @@ pub const Ring = struct {
             .cqTail = @ptrCast(@alignCast(cqBase + params.cq_off.tail)),
             .cqMask = cqMaskPtr.*,
             .cqEntries = @ptrCast(@alignCast(cqBase + params.cq_off.cqes)),
-            .bufPools = [_]BufferPool{BufferPool.initUninitialized()} ** @typeInfo(BufferClass).@"enum".fields.len,
+            .bufPools = [_]BufferPool{BufferPool.initUninitialized()} ** @typeInfo(BufferSizeClass).@"enum".fields.len,
         };
     }
 
@@ -199,7 +199,7 @@ pub const Ring = struct {
         }
     }
 
-    pub fn initializeSizeClassBuffer(self: *Self, sizeClass: BufferClass, entries: u32) !void {
+    pub fn initializeSizeClassBuffer(self: *Self, sizeClass: BufferSizeClass, entries: u32) !void {
         const idx = @intFromEnum(sizeClass);
         const bufPool = &self.bufPools[idx];
         if (!bufPool.isInactive()) {
@@ -305,7 +305,7 @@ pub const Ring = struct {
         self: *Self,
         targetFd: posix.fd_t,
         taskIdx: u64,
-        size: BufferClass,
+        size: BufferSizeClass,
         flags: TaskFlags,
     ) !void {
         const bgid = @intFromEnum(size);
@@ -331,7 +331,7 @@ pub const Ring = struct {
         self: *Self,
         targetFd: posix.fd_t,
         taskIdx: u64,
-        size: BufferClass,
+        size: BufferSizeClass,
         flags: TaskFlags,
     ) !void {
         const bgid = @intFromEnum(size);
@@ -357,7 +357,7 @@ pub const Ring = struct {
         self: *Self,
         targetFd: posix.fd_t,
         taskIdx: u64,
-        size: BufferClass,
+        size: BufferSizeClass,
         flags: TaskFlags,
     ) !void {
         const bgid = @intFromEnum(size);
