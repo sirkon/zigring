@@ -8,12 +8,12 @@ pub const page_size: usize = 4096;
 pub const fireAndForgetTaskIdx: u64 = std.math.maxInt(u64);
 
 pub const BufferSizeClass = enum(u16) {
-    tiny = 0, // 128 B
-    small = 1, // 512 B
-    net = 2, // 2 KiB (Ideal for MTU / Ethernet frames)
-    page = 3, // 4 KiB (Standard Linux page size)
-    big = 4, // 16 KiB
-    huge = 5, // 64 KiB
+    tiny, // 128 B
+    small, // 512 B
+    net, // 2 KiB (Ideal for MTU / Ethernet frames)
+    page, // 4 KiB (Standard Linux page size)
+    big, // 16 KiB
+    huge, // 64 KiB
 
     /// Returns the exact size of the class in bytes
     pub inline fn size(self: BufferSizeClass) u32 {
@@ -26,34 +26,39 @@ pub const BufferSizeClass = enum(u16) {
             .huge => 64 * 1024,
         };
     }
+
+    /// Returns bgid for the given SizeClass.
+    pub inline fn bgid(self: BufferSizeClass) usize {
+        return @intFromEnum(self);
+    }
 };
 
 /// Flags for SQE.
 pub const TaskFlags = packed struct(u8) {
     const Self = @This();
 
-    /// IOSQE_FIXED_FILE (1 << 0): Использовать заранее зарегистрированные файлы (registered fds) вместо обычных
+    /// IOSQE_FIXED_FILE (1 << 0): Use pre-registered files (registered fds) instead of regular ones
     FixedFile: bool = false,
 
-    /// IOSQE_IODONE_HO_WO (1 << 1): Старый внутренний флаг ядра. Не используется в пользовательском коде (можно оставить false)
+    /// IOSQE_IODONE_HO_WO (1 << 1): Old internal kernel flag. Not used in user code (can stay false)
     _iosqe_idone_ho_wo: bool = false,
 
-    /// IOSQE_IO_DRAIN (1 << 2): Ждать завершения ВСЕХ предыдущих задач в кольце перед тем, как начать эту
+    /// IOSQE_IO_DRAIN (1 << 2): Wait for ALL previous tasks in the ring to complete before starting this one
     Drain: bool = false,
 
-    /// IOSQE_IO_LINK (1 << 3): Связать эту задачу со следующей. Тот самый флаг, который вам нужен для таймера!
+    /// IOSQE_IO_LINK (1 << 3): Link this task with the next one. The very flag you need for a timer!
     Link: bool = false,
 
-    /// IOSQE_IO_HARDLINK (1 << 4): Похож на io_link, но цепочка не рвется, даже если предыдущая задача упала с ошибкой
+    /// IOSQE_IO_HARDLINK (1 << 4): Like io_link, but the chain doesn't break even if the previous task failed with an error
     HardLink: bool = false,
 
-    /// IOSQE_ASYNC (1 << 5): Принудительно запустить задачу асинхронно в воркерах ядра (io-wq), даже если она не блокирующая
+    /// IOSQE_ASYNC (1 << 5): Force the task to run asynchronously in kernel workers (io-wq), even if it's non-blocking
     ForceAsync: bool = false,
 
-    /// IOSQE_BUFFER_SELECT (1 << 6): Использовать автоматический выбор буфера из пула ядра (для IORING_OP.PROVIDE_BUFFERS)
+    /// IOSQE_BUFFER_SELECT (1 << 6): Use automatic buffer selection from the kernel pool (for IORING_OP.PROVIDE_BUFFERS)
     BufferSelect: bool = false,
 
-    /// IOSQE_CQE_SKIP_SUCCESS (1 << 7): Не генерировать CQE в очереди завершения, если задача выполнилась успешно
+    /// IOSQE_CQE_SKIP_SUCCESS (1 << 7): Don't generate a CQE in the completion queue if the task succeeded
     SkipSuccess: bool = false,
 
     pub inline fn flags(self: Self) u8 {
@@ -74,15 +79,17 @@ pub const CQE = struct {
     bid: u16,
     hasBuffer: bool,
     hasMore: bool,
+    hasNotif: bool,
 
     /// Return errno for given res.
-    pub inline fn errno(self: CQE) posix.UnexpectedError!void {
-        if (self.res >= 0) {
-            return;
-        }
-
+    pub inline fn errno(self: CQE) linux.E {
         const resU: usize = @bitCast(@as(i64, self.res));
-        return std.posix.unexpectedErrno(linux.errno(resU));
+        return linux.errno(resU);
+    }
+
+    /// Result as usize.
+    pub inline fn result(self: CQE) usize {
+        return @as(usize, @bitCast(@as(i64, self.res)));
     }
 };
 
@@ -119,6 +126,7 @@ pub const Ring = struct {
 
         var params = std.mem.zeroes(linux.io_uring_params);
         params.flags = linux.IORING_SETUP_SQPOLL;
+        params.sq_thread_idle = 1000;
 
         if (attachFd) |masterFd| {
             params.flags |= linux.IORING_SETUP_ATTACH_WQ;
@@ -199,7 +207,7 @@ pub const Ring = struct {
         }
     }
 
-    pub fn initializeSizeClassBuffer(self: *Self, sizeClass: BufferSizeClass, entries: u32) !void {
+    pub fn regiterSizeClassReceiveBuffer(self: *Self, sizeClass: BufferSizeClass, entries: u32) !void {
         const idx = @intFromEnum(sizeClass);
         const bufPool = &self.bufPools[idx];
         if (!bufPool.isInactive()) {
@@ -207,6 +215,91 @@ pub const Ring = struct {
         }
 
         bufPool.* = try BufferPool.init(self.fd, idx, entries, sizeClass.size());
+    }
+
+    // 2 MiB huge page size.
+    const hugePageSize: usize = 1 << 21;
+    const hugePageMask: u32 = 21 << 26;
+
+    const MMapError = posix.MMapError;
+
+    /// Allocates an area of `entries` buffers of the given size class on huge
+    /// pages (with a regular-page fallback), registers it into io_uring and
+    /// returns the backing memory as a flat, page-aligned []u8.
+    ///
+    /// The returned slice is an mmap mapping, so release it with posix.munmap.
+    /// Its length is rounded up to the mmap page size (2 MiB when huge pages
+    /// are available), which may exceed sizeClass.size() * entries. Only the
+    /// first sizeClass.size() * entries bytes are used as buffers.
+    pub fn registerBuffers(self: *Self, sizeClass: BufferSizeClass, entries: u32) ![]align(std.heap.pageSize()) u8 {
+        const buf_size = sizeClass.size();
+        const total = @as(usize, buf_size) * entries;
+
+        const backing_mem = try mmapPool(total);
+        errdefer posix.munmap(backing_mem);
+
+        // Standard Linux ABI requires an array of iovec structures:
+        // struct iovec { void *iov_base; size_t iov_len; };
+        const allocator = std.heap.page_allocator;
+        const iovecs = try allocator.alloc(posix.iovec, entries);
+        defer allocator.free(iovecs);
+
+        var i: u32 = 0;
+        while (i < entries) : (i += 1) {
+            const offset = @as(usize, i) * buf_size;
+            iovecs[i] = .{
+                .base = @ptrCast(backing_mem.ptr + offset),
+                .len = buf_size,
+            };
+        }
+
+        const res = std.os.linux.syscall4(
+            .io_uring_register,
+            @intCast(self.fd),
+            @intFromEnum(linux.IORING_REGISTER.REGISTER_BUFFERS),
+            @intFromPtr(iovecs.ptr),
+            entries,
+        );
+
+        if (std.os.linux.errno(res) != .SUCCESS) {
+            return error.RegisterBuffersFailed;
+        }
+
+        return backing_mem;
+    }
+
+    /// mmap a pool of at least `rawSize` bytes, preferring 2 MiB huge pages
+    /// and falling back to regular 4096-byte pages when the OS has none.
+    fn mmapPool(rawSize: usize) MMapError![]align(std.heap.pageSize()) u8 {
+        const prot = linux.PROT{ .READ = true, .WRITE = true };
+
+        // First try huge pages: SHARED | ANONYMOUS | HUGETLB with the 2 MiB
+        // page size bitmask in the map flags. The Zig MAP packed struct has
+        // no slot for the page mask, so it must be OR-ed into the raw flags
+        // (bits 26-31 are padding). The kernel rounds the length up to the
+        // huge page size, so the mapping is 2 MiB aligned in both address
+        // and length.
+        const hugeSize = std.mem.alignForward(usize, rawSize, hugePageSize);
+        var hugeFlags: u32 = @bitCast(linux.MAP{
+            .TYPE = .SHARED,
+            .ANONYMOUS = true,
+            .HUGETLB = true,
+        });
+        hugeFlags |= hugePageMask;
+
+        return posix.mmap(null, hugeSize, prot, @bitCast(hugeFlags), -1, 0) catch blk: {
+            // No huge pages configured in the OS: transparently fall back
+            // to a plain anonymous mapping.
+            const regularSize = std.mem.alignForward(usize, rawSize, page_size);
+            break :blk try posix.mmap(
+                null,
+                regularSize,
+                prot,
+                linux.MAP{ .TYPE = .SHARED, .ANONYMOUS = true },
+                -1,
+                0,
+            );
+        };
     }
 
     // try to retrieve a room for a new op.
@@ -259,6 +352,21 @@ pub const Ring = struct {
         return posix.unexpectedErrno(linux.errno(-res));
     }
 
+    /// Opens a batched submission window over the SQ. It snapshots the current
+    /// SQ head and tail and hands back a `BatchSQ` that reserves SQEs without
+    /// publishing them, so many operations can be flushed with a single
+    /// `io_uring_enter`. Returns null when the ring is already full.
+    pub inline fn batchedSQ(self: *Self) ?BatchSQ {
+        const tail = self.sqTail.*;
+        const head = @atomicLoad(u32, self.sqHead, .acquire);
+
+        if (tail -% head >= self.sqMask + 1) {
+            return null;
+        }
+
+        return .{ .ring = self, .head = head, .tail = tail };
+    }
+
     pub inline fn pushWrite(
         self: *Self,
         targetFd: posix.fd_t,
@@ -295,6 +403,48 @@ pub const Ring = struct {
         sqe.fd = targetFd;
         sqe.addr = @intFromPtr(dataPtr);
         sqe.len = @intCast(len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Zero-copy send (`IORING_OP.SEND_ZC`) straight out of a buffer that was
+    /// registered with `registerBuffers` on this same ring.
+    ///
+    /// `bufIndex` is the index (0..entries-1) of the registered buffer that
+    /// backs `dataPtr`, and `dataPtr`/`len` may select any part of it: the
+    /// kernel pins the pages once and hands them to the network stack instead
+    /// of copying the payload, so the buffer must not be modified or reused
+    /// until the matching completion with `CQE.hasNotif` set arrives.
+    ///
+    /// A successful request produces two completions: the first carries the
+    /// number of bytes queued (`CQE.hasMore` is set), the second is the
+    /// notification that frees the buffer for reuse (`CQE.hasNotif` is set).
+    ///
+    /// `msgFlags` are the regular `MSG_*` flags (e.g. `MSG_NOSIGNAL`).
+    pub inline fn pushSendZC(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        bufIndex: u16,
+        msgFlags: u32,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.SEND_ZC;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        // MSG_* flags live in rw_flags, while the zerocopy selectors
+        // (IORING_RECVSEND_*) live in ioprio.
+        sqe.rw_flags = msgFlags;
+        sqe.ioprio = linux.IORING_RECVSEND_FIXED_BUF;
+        sqe.buf_index = bufIndex;
         sqe.user_data = taskIdx;
         sqe.flags = flags.flags();
 
@@ -546,14 +696,19 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
-    /// Asynchronously binds a socket to a local address.
-    /// WARNING: targetSockAddr must remain valid in memory until the operation completes!
-    pub inline fn pushBind(
+    /// Low-level bind primitive: submits `IORING_OP.BIND` for `socketFd`
+    /// against a raw POSIX socket address.
+    ///
+    /// `sockAddr`/`sockLen` describe the local address and must stay valid
+    /// until the operation completes, because the kernel reads them from the
+    /// SQE asynchronously. Callers normally do not need this directly: prefer
+    /// `pushBindIp4`/`pushBindIp6`, which build the address from a string.
+    inline fn pushBind(
         self: *Self,
         socketFd: posix.fd_t,
         taskIdx: u64,
-        address: *const std.Io.net.IpAddress,
-        targetSockAddr: *posix.sockaddr.storage, // Передаем указатель на долгоживущую структуру!
+        sockAddr: *const posix.sockaddr,
+        sockLen: u32,
         flags: TaskFlags,
     ) !void {
         const targetSlot = try self.getOpSlot();
@@ -561,41 +716,138 @@ pub const Ring = struct {
 
         sqe.opcode = linux.IORING_OP.BIND;
         sqe.fd = socketFd;
+        // io_uring takes the address pointer in `addr` and its length in `off`
+        // (which aliases `addr2` in the kernel ABI).
+        sqe.addr = @intFromPtr(sockAddr);
+        sqe.off = sockLen;
         sqe.user_data = taskIdx;
         sqe.flags = flags.flags();
 
-        // Передаем адрес структуры в sqe.addr (ядро хочет u64)
-        sqe.addr = @intFromPtr(targetSockAddr);
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
 
-        // Наполняем структуру данными в зависимости от типа IP
-        switch (address.*) {
-            .ip4 => |ip4| {
-                const inAddr = posix.sockaddr.in{
-                    .family = posix.AF.INET,
-                    .port = std.mem.nativeToBig(u16, ip4.port),
-                    .addr = @bitCast(ip4.bytes),
-                };
-                // Копируем прямо в переданную структуру
-                @memcpy(std.mem.asBytes(targetSockAddr)[0..@sizeOf(posix.sockaddr.in)], std.mem.asBytes(&inAddr));
+    /// Low-level connect primitive: submits `IORING_OP.CONNECT` for `socketFd`
+    /// against a raw POSIX peer address.
+    ///
+    /// `sockAddr`/`sockLen` describe the peer address and must stay valid until
+    /// the operation completes, because the kernel reads them from the SQE
+    /// asynchronously. Callers normally do not need this directly: prefer
+    /// `pushConnectIp4`/`pushConnectIp6`, which build the address from a string.
+    inline fn pushConnect(
+        self: *Self,
+        socketFd: posix.fd_t,
+        taskIdx: u64,
+        sockAddr: *const posix.sockaddr,
+        sockLen: u32,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
 
-                // В io_uring размер структуры передается в поле sqe.off (оно же союзное с addr2)
-                sqe.off = @sizeOf(posix.sockaddr.in);
-            },
-            .ip6 => |ip6| {
-                const in6Addr = posix.sockaddr.in6{
-                    .family = posix.AF.INET6,
-                    .port = std.mem.nativeToBig(u16, ip6.port),
-                    .flowinfo = ip6.flow,
-                    .addr = ip6.bytes,
-                    .scope_id = 0,
-                };
-                @memcpy(std.mem.asBytes(targetSockAddr)[0..@sizeOf(posix.sockaddr.in6)], std.mem.asBytes(&in6Addr));
-
-                sqe.off = @sizeOf(posix.sockaddr.in6);
-            },
-        }
+        sqe.opcode = linux.IORING_OP.CONNECT;
+        sqe.fd = socketFd;
+        sqe.addr = @intFromPtr(sockAddr);
+        sqe.off = sockLen;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Binds `fd` to the IPv4 endpoint `ip_str`:`port`.
+    ///
+    /// `ip_str` is dotted-decimal, for example "127.0.0.1", or "0.0.0.0" to
+    /// listen on every interface. The text is parsed and packed into a
+    /// `sockaddr.in` for you, so callers never declare POSIX address structs or
+    /// cast pointers by hand. `flags` carries the usual `TaskFlags`.
+    pub inline fn pushBindIp4(
+        self: *Self,
+        fd: posix.fd_t,
+        user_data: u64,
+        ip_str: []const u8,
+        port: u16,
+        flags: TaskFlags,
+    ) !void {
+        const ip = try std.Io.net.Ip4Address.parse(ip_str, port);
+        const sock_addr = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, ip.port),
+            .addr = @bitCast(ip.bytes),
+        };
+        try self.pushBind(fd, user_data, @ptrCast(&sock_addr), @sizeOf(posix.sockaddr.in), flags);
+    }
+
+    /// Connects `fd` to the IPv4 endpoint `ip_str`:`port`.
+    ///
+    /// `ip_str` is dotted-decimal, for example "127.0.0.1". The text is parsed
+    /// and packed into a `sockaddr.in` for you, so callers never declare POSIX
+    /// address structs or cast pointers by hand. `flags` carries the usual
+    /// `TaskFlags`.
+    pub inline fn pushConnectIp4(
+        self: *Self,
+        fd: posix.fd_t,
+        user_data: u64,
+        ip_str: []const u8,
+        port: u16,
+        flags: TaskFlags,
+    ) !void {
+        const ip = try std.Io.net.Ip4Address.parse(ip_str, port);
+        const sock_addr = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, ip.port),
+            .addr = @bitCast(ip.bytes),
+        };
+        try self.pushConnect(fd, user_data, @ptrCast(&sock_addr), @sizeOf(posix.sockaddr.in), flags);
+    }
+
+    /// Binds `fd` to the IPv6 endpoint `ip_str`:`port`.
+    ///
+    /// `ip_str` is the textual IPv6 form, for example "::1", or "::" to listen
+    /// on every interface. The text is parsed and packed into a `sockaddr.in6`
+    /// for you, so callers never declare POSIX address structs or cast pointers
+    /// by hand. `flags` carries the usual `TaskFlags`.
+    pub inline fn pushBindIp6(
+        self: *Self,
+        fd: posix.fd_t,
+        user_data: u64,
+        ip_str: []const u8,
+        port: u16,
+        flags: TaskFlags,
+    ) !void {
+        const ip = try std.Io.net.Ip6Address.parse(ip_str, port);
+        const sock_addr = posix.sockaddr.in6{
+            .family = posix.AF.INET6,
+            .port = std.mem.nativeToBig(u16, ip.port),
+            .flowinfo = ip.flow,
+            .addr = ip.bytes,
+            .scope_id = 0,
+        };
+        try self.pushBind(fd, user_data, @ptrCast(&sock_addr), @sizeOf(posix.sockaddr.in6), flags);
+    }
+
+    /// Connects `fd` to the IPv6 endpoint `ip_str`:`port`.
+    ///
+    /// `ip_str` is the textual IPv6 form, for example "::1". The text is parsed
+    /// and packed into a `sockaddr.in6` for you, so callers never declare POSIX
+    /// address structs or cast pointers by hand. `flags` carries the usual
+    /// `TaskFlags`.
+    pub inline fn pushConnectIp6(
+        self: *Self,
+        fd: posix.fd_t,
+        user_data: u64,
+        ip_str: []const u8,
+        port: u16,
+        flags: TaskFlags,
+    ) !void {
+        const ip = try std.Io.net.Ip6Address.parse(ip_str, port);
+        const sock_addr = posix.sockaddr.in6{
+            .family = posix.AF.INET6,
+            .port = std.mem.nativeToBig(u16, ip.port),
+            .flowinfo = ip.flow,
+            .addr = ip.bytes,
+            .scope_id = 0,
+        };
+        try self.pushConnect(fd, user_data, @ptrCast(&sock_addr), @sizeOf(posix.sockaddr.in6), flags);
     }
 
     pub inline fn pushListen(
@@ -732,6 +984,10 @@ pub const Ring = struct {
         // Bit 1 (1 << 1): IORING_CQE_F_MORE. Multishot is active, the kernel will keep sending CQEs
         const hasMore = (flags & 2) != 0;
 
+        // Bit 3 (1 << 3): IORING_CQE_F_NOTIF. This is the second CQE of a
+        // SEND_ZC request; it signals that the registered buffer may be reused.
+        const hasNotif = (flags & 8) != 0;
+
         // Extract the Buffer ID from the upper 16 bits of the flags field (shift right by 16)
         const bid = @as(u16, @intCast(flags >> 16));
 
@@ -744,7 +1000,24 @@ pub const Ring = struct {
             .bid = bid,
             .hasBuffer = hasBuffer,
             .hasMore = hasMore,
+            .hasNotif = hasNotif,
         };
+    }
+
+    /// Opens a batched consumption window over the CQ. It snapshots the current
+    /// CQ head and tail and hands back a `BatchedCQ` that reads completions
+    /// without publishing the consumed head, so many completions can be drained
+    /// and flushed with a single `io_uring_enter` on `commit`. Returns null when
+    /// there is nothing to consume, i.e. as soon as the head reaches the tail.
+    pub inline fn batchedCQ(self: *Self) ?BatchCQ {
+        const head = self.cqHead.*;
+        const tail = @atomicLoad(u32, self.cqTail, .acquire);
+
+        if (head == tail) {
+            return null;
+        }
+
+        return .{ .ring = self, .head = head, .tail = tail };
     }
 
     /// Puts the current thread-index to sleep until at least one CQE appears.
@@ -781,112 +1054,227 @@ pub const Ring = struct {
             @panic("Fatal: io_uring_enter failed during park state!");
         }
     }
+
+    pub fn releaseBuffer(self: *Self, sizeClass: BufferSizeClass, bid: u16) void {
+        self.bufPools[sizeClass.bgid()].releaseBuffer(bid);
+    }
+
+    pub fn buffer(self: *Self, sizeClass: BufferSizeClass, bid: u16) ?[]const u8 {
+        var bufpool: BufferPool = self.bufPools[sizeClass.bgid()];
+        return bufpool.buffer(bid) catch {
+            return null;
+        };
+    }
 };
 
-test "create and write file" {
-    const Manager = @import("ring_manager.zig").WeightedRingManager;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
-    defer mgr.deinit();
+/// A batched view over the submission queue, created by `Ring.batchedSQ`.
+///
+/// Operations pushed through it are written into the ring but stay invisible
+/// to the kernel until `commit` advances the ring's tail. This lets callers
+/// queue many operations and flush them with a single wakeup. Each push
+/// returns null once the window is exhausted, i.e. as soon as it would
+/// overwrite an SQE the kernel has not consumed yet.
+pub const BatchSQ = struct {
+    const Self = @This();
 
-    var ring = try mgr.acquireRing(128, 1);
-    try ring.pushOpenDir(1, 0, "/tmp", .{});
+    /// The ring this batch belongs to.
+    ring: *Ring,
+    /// SQ head captured when the batch was opened.
+    head: u32,
+    /// SQ producer cursor. It starts at the tail captured when the batch was
+    /// opened and advances with every pushed operation.
+    tail: u32,
 
-    var cqe = try wait(&ring);
-    const dirFd = cqe.res;
+    /// Reserves the next SQE, zeroes it and records it in the SQ array.
+    /// Returns null once the window reaches the captured head plus one full
+    /// ring length.
+    inline fn reserve(self: *Self) ?*linux.io_uring_sqe {
+        const ring = self.ring;
 
-    try ring.pushOpenFile(1, dirFd, "file.txt", linux.O{ .CREAT = true, .ACCMODE = .WRONLY }, .{});
-    cqe = try wait(&ring);
-    const fileFd = cqe.res;
+        if (self.tail -% self.head >= ring.sqMask + 1) {
+            return null;
+        }
 
-    try ring.pushWrite(fileFd, 1, "Hello World!\n", 13, .{});
-    cqe = try wait(&ring);
+        const idx = self.tail & ring.sqMask;
+        const sqe = &ring.sqEntries[idx];
 
-    try ring.pushClose(1, fileFd, .{});
-    cqe = try wait(&ring);
+        @memset(std.mem.asBytes(sqe), 0);
+        ring.sqArray[idx] = idx;
 
-    // Now, need to check if the file was successfully written.
-    const io = std.testing.io;
-    var buffer: [256]u8 = undefined;
+        self.tail +%= 1;
 
-    const content = try std.Io.Dir.readFile(std.Io.Dir.cwd(), io, "/tmp/file.txt", buffer[0..]);
-    try std.testing.expectEqualSlices(u8, "Hello World!\n", content);
-}
+        return sqe;
+    }
 
-test "create a server and wait for 1 second for incoming connections what will never happen" {
-    const Manager = @import("ring_manager.zig").WeightedRingManager;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
-    defer mgr.deinit();
+    pub inline fn pushWrite(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
 
-    var ring = try mgr.acquireRing(128, 1);
+        sqe.opcode = linux.IORING_OP.WRITE;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
 
-    const sockets = @import("sockets.zig");
-    const sockFd = try sockets.createServerSocket();
-    defer _ = linux.close(sockFd);
+    pub inline fn pushSend(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
 
-    const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", 60006);
+        sqe.opcode = linux.IORING_OP.SEND;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
 
-    var sockAddr: std.posix.sockaddr.storage = undefined;
-    try ring.pushBind(sockFd, 1, &addr, &sockAddr, .{});
-    var cqe = try wait(&ring);
+    /// Zero-copy send, mirroring `Ring.pushSendZC`. See that method for the
+    /// buffer lifetime and dual-completion semantics.
+    pub inline fn pushSendZC(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        bufIndex: u16,
+        msgFlags: u32,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
 
-    try ring.pushListen(sockFd, 1, 1, .{});
-    _ = try wait(&ring);
+        sqe.opcode = linux.IORING_OP.SEND_ZC;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        sqe.rw_flags = msgFlags;
+        sqe.ioprio = linux.IORING_RECVSEND_FIXED_BUF;
+        sqe.buf_index = bufIndex;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
 
-    while (true) {
-        try ring.pushAccept(sockFd, 2, TaskFlags.expectNext());
-        const timerSpec = linux.kernel_timespec{
-            .sec = 1,
-            .nsec = 0,
+    /// Publishes every SQE pushed so far by atomically moving the ring's tail,
+    /// then nudges the kernel poller so it observes the new entries.
+    pub fn commit(self: *Self) !void {
+        const ring = self.ring;
+
+        @atomicStore(u32, ring.sqTail, self.tail, .release);
+
+        var sig: linux.sigset_t = undefined;
+        const res = linux.io_uring_enter(
+            ring.fd,
+            1,
+            0,
+            linux.IORING_ENTER_SQ_WAKEUP,
+            &sig,
+        );
+
+        const err = linux.errno(res);
+        if (err == .SUCCESS) {
+            return;
+        }
+
+        return posix.unexpectedErrno(err);
+    }
+};
+
+/// A batched view over the completion queue, created by `Ring.batchedCQ`.
+///
+/// Completions are read through it into a local cursor without moving the
+/// ring's consumed head, so the kernel keeps treating them as unconsumed until
+/// `commit` publishes the advanced head with a single wakeup. Each `popCQE`
+/// returns null once the window is exhausted, i.e. as soon as it reaches the
+/// tail captured when the batch was opened.
+pub const BatchCQ = struct {
+    const Self = @This();
+
+    /// The ring this batch belongs to.
+    ring: *Ring,
+    /// CQ consumer cursor. It starts at the head captured when the batch was
+    /// opened and advances with every popped completion.
+    head: u32,
+    /// CQ tail captured when the batch was opened: the upper bound of the
+    /// completions visible to this batch.
+    tail: u32,
+
+    /// Reads the next completion visible to this batch and advances the local
+    /// consumer cursor. The ring's head is left untouched until `commit`.
+    /// Returns null once the captured tail is reached.
+    pub inline fn popCQE(self: *Self) ?CQE {
+        if (self.head == self.tail) {
+            return null;
+        }
+
+        const ring = self.ring;
+        const cqeIdx = self.head & ring.cqMask;
+        const cqe = &ring.cqEntries[cqeIdx];
+
+        const taskIdx = cqe.user_data;
+        const outRes = cqe.res;
+        const flags = cqe.flags;
+
+        // Bit 0 (1 << 0): the kernel selected a provided buffer from our pool
+        const hasBuffer = (flags & 1) != 0;
+
+        // Bit 1 (1 << 1): IORING_CQE_F_MORE. Multishot is active, the kernel will keep sending CQEs
+        const hasMore = (flags & 2) != 0;
+
+        // Bit 3 (1 << 3): IORING_CQE_F_NOTIF. This is the second CQE of a
+        // SEND_ZC request; it signals that the registered buffer may be reused.
+        const hasNotif = (flags & 8) != 0;
+
+        // Extract the Buffer ID from the upper 16 bits of the flags field (shift right by 16)
+        const bid = @as(u16, @intCast(flags >> 16));
+
+        // Advance the batch cursor only; the ring head stays put until commit.
+        self.head +%= 1;
+
+        return CQE{
+            .taskIdx = taskIdx,
+            .res = outRes,
+            .bid = bid,
+            .hasBuffer = hasBuffer,
+            .hasMore = hasMore,
+            .hasNotif = hasNotif,
         };
-        try ring.pushTimeoutForOp(&timerSpec, 3, TaskFlags{ .SkipSuccess = true });
+    }
 
-        var needReroll = false;
-        for (0..2) |_| {
-            cqe = waitNoMatterWhat(&ring);
-            if (cqe.taskIdx != 2) {
-                continue;
-            }
+    /// Publishes every popped completion by atomically moving the ring's
+    /// consumed head to the batch cursor, then nudges the kernel poller so it
+    /// notices the freed completion slots.
+    pub fn commit(self: *Self) !void {
+        const ring = self.ring;
 
-            if (cqe.res >= 0) {
-                std.debug.print("unexpected success: {}\n", .{cqe});
-                return error.UnexpectedSuccess;
-            }
+        @atomicStore(u32, ring.cqHead, self.head, .release);
 
-            const resU: usize = @bitCast(@as(i64, cqe.res));
-            switch (linux.errno(resU)) {
-                linux.E.CANCELED => return,
-                linux.E.AGAIN => {
-                    needReroll = true;
-                },
-                else => {
-                    std.debug.print("unexpected error {!} in {} \n", .{ cqe.errno(), cqe });
-                    try std.testing.expect(false);
-                },
-            }
+        var sig: linux.sigset_t = undefined;
+        const res = linux.io_uring_enter(
+            ring.fd,
+            0,
+            0,
+            linux.IORING_ENTER_SQ_WAKEUP,
+            &sig,
+        );
+
+        const err = linux.errno(res);
+        if (err == .SUCCESS) {
+            return;
         }
 
-        if (!needReroll) {
-            break;
-        }
+        return posix.unexpectedErrno(err);
     }
-}
-
-fn wait(ring: *Ring) !CQE {
-    while (true) {
-        const cqe = ring.popCQE() orelse continue;
-
-        try cqe.errno();
-        return cqe;
-    }
-}
-
-fn waitNoMatterWhat(ring: *Ring) CQE {
-    while (true) {
-        const cqe = ring.popCQE() orelse continue;
-        return cqe;
-    }
-}
+};

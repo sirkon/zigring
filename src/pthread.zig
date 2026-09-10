@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = std.c;
 
-// Импортируем сишные функции напрямую из libc руками
+// Import C functions directly from libc by hand
 extern "c" fn pthread_mutex_init(mutex: *c.pthread_mutex_t, attr: ?*const anyopaque) c_int;
 extern "c" fn pthread_mutex_destroy(mutex: *c.pthread_mutex_t) c_int;
 extern "c" fn pthread_mutex_lock(mutex: *c.pthread_mutex_t) c_int;
@@ -13,7 +13,7 @@ extern "c" fn pthread_cond_wait(cond: *c.pthread_cond_t, mutex: *c.pthread_mutex
 extern "c" fn pthread_cond_signal(cond: *c.pthread_cond_t) c_int;
 extern "c" fn pthread_cond_broadcast(cond: *c.pthread_cond_t) c_int;
 
-// Тип для маски ядер. На Linux это структура, но по размеру она занимает 128 байт (хватит на 1024 ядра)
+// Type for the CPU mask. On Linux this is a struct, but its size is 128 bytes (enough for 1024 cores)
 const cpu_set_t = extern struct {
     __bits: [128 / @sizeOf(c_ulong)]c_ulong,
 };
@@ -28,10 +28,10 @@ pub const Mutex = struct {
 
     pub fn init() Mutex {
         var self = Mutex{
-            // Корректно зануляем память под структуру Си
+            // Properly zero the memory for the C struct
             .raw = std.mem.zeroes(c.pthread_mutex_t),
         };
-        // Инициализируем мьютекс с дефолтными атрибутами (null)
+        // Initialize the mutex with default attributes (null)
         _ = pthread_mutex_init(&self.raw, null);
         return self;
     }
@@ -41,7 +41,7 @@ pub const Mutex = struct {
     }
 
     pub fn lock(self: *Mutex) void {
-        // Обычная блокировка: если занято, поток засыпает в ядре ОС
+        // Regular blocking lock: if busy, the thread sleeps in the OS kernel
         _ = pthread_mutex_lock(&self.raw);
     }
 
@@ -65,17 +65,17 @@ pub const CondVar = struct {
         _ = pthread_cond_destroy(&self.raw);
     }
 
-    // Передаем твою обертку Mutex. Внутри атомарно отпускаем Си-мьютекс и ждем
+    // Pass your Mutex wrapper. Inside, atomically release the C mutex and wait
     pub fn wait(self: *CondVar, mutex: *Mutex) void {
         _ = pthread_cond_wait(&self.raw, &mutex.raw);
     }
 
-    // Пробуждает один поток
+    // Wakes up one thread
     pub fn signal(self: *CondVar) void {
         _ = pthread_cond_signal(&self.raw);
     }
 
-    // Пробуждает все потоки, которые ждут на этом кондваре
+    // Wakes up all threads waiting on this condvar
     pub fn broadcast(self: *CondVar) void {
         _ = pthread_cond_broadcast(&self.raw);
     }
@@ -84,7 +84,7 @@ pub const CondVar = struct {
 pub const Thread = struct {
     raw: c.pthread_t,
 
-    // spawn принимает Zig-функцию и указатель на любые данные
+    // spawn takes a Zig function and a pointer to any data
     pub fn spawn(context: anytype, comptime f: anytype) !Thread {
         const ContextType = @TypeOf(context);
 
@@ -100,13 +100,13 @@ pub const Thread = struct {
             }
         }.run;
 
-        // Создаем структуру с незаданным (мусорным) состоянием
+        // Create the struct with uninitialized (garbage) state
         var self = Thread{
             .raw = undefined,
         };
 
-        // Зануляем raw-память хэндла потока напрямую побайтово
-        // Это обходит проверку типов Zig и работает на любой ОС/libc
+        // Zero the thread handle's raw memory directly, byte by byte
+        // This bypasses Zig's type checks and works on any OS/libc
         const bytes = @as([*]u8, @ptrCast(&self.raw))[0..@sizeOf(c.pthread_t)];
         @memset(bytes, 0);
 
@@ -122,13 +122,13 @@ pub const Thread = struct {
         _ = pthread_join(self.raw, null);
     }
 
-    /// Привязывает текущий (этот) поток к конкретному ядру ЦП
+    /// Pins this (the current) thread to a specific CPU core
     pub fn setAffinity(self: Thread, core_id: u32) !void {
         var cpuset: cpu_set_t = undefined;
-        // Полностью очищаем маску ядер
+        // Fully clear the CPU mask
         @memset(@as([*]u8, @ptrCast(&cpuset))[0..@sizeOf(cpu_set_t)], 0);
 
-        // Устанавливаем бит нужного ядра (аналог макроса CPU_SET)
+        // Set the bit for the desired core (equivalent of the CPU_SET macro)
         const word_index = core_id / (@sizeOf(c_ulong) * 8);
         const bit_index = core_id % (@sizeOf(c_ulong) * 8);
 
@@ -139,7 +139,7 @@ pub const Thread = struct {
         if (res != 0) return error.SetCpuAffinityFailed;
     }
 
-    /// Позволяет вызывающему потоку жестко привязать самого себя к ядру
+    /// Lets the calling thread pin itself to a core
     pub fn setSelfAffinity(core_id: u32) !void {
         const self_thread = Thread{ .raw = pthread_self() };
         try self_thread.setAffinity(core_id);
@@ -147,7 +147,7 @@ pub const Thread = struct {
 };
 
 test "pthread wrappers: mutex, condvar, and thread workflow" {
-    // Структура для общего состояния между потоками
+    // Struct for shared state between threads
     const SharedState = struct {
         mutex: Mutex,
         cond: CondVar,
@@ -155,7 +155,7 @@ test "pthread wrappers: mutex, condvar, and thread workflow" {
         counter: i32,
     };
 
-    // Инициализируем наше состояние
+    // Initialize our state
     var state = SharedState{
         .mutex = Mutex.init(),
         .cond = CondVar.init(),
@@ -165,42 +165,42 @@ test "pthread wrappers: mutex, condvar, and thread workflow" {
     defer state.mutex.deinit();
     defer state.cond.deinit();
 
-    // Локальная функция для фонового потока
+    // Local function for the background thread
     const worker = struct {
         fn run(s: *SharedState) void {
             s.mutex.lock();
             defer s.mutex.unlock();
 
-            // Ждем, пока главный поток не переведет ready в true
+            // Wait until the main thread sets ready to true
             while (!s.ready) {
                 s.cond.wait(&s.mutex);
             }
 
-            // Меняем данные под защитой мьютекса
+            // Modify data under the mutex
             s.counter += 42;
         }
     }.run;
 
-    // 1. Запускаем поток
+    // 1. Spawn the thread
     const thread = try Thread.spawn(&state, worker);
 
-    // Даем фоновому потоку время запуститься и уйти в ожидание cond.wait()
+    // Give the background thread time to start and block in cond.wait()
     try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .awake);
 
-    // Проверяем, что счетчик все еще 0 (поток ждет)
+    // Check that the counter is still 0 (the thread is waiting)
     try std.testing.expectEqual(@as(i32, 0), state.counter);
 
-    // 2. Захватываем мьютекс и меняем состояние ready
+    // 2. Lock the mutex and set ready to true
     state.mutex.lock();
     state.ready = true;
     state.mutex.unlock();
 
-    // Отправляем сигнал, чтобы разбудить поток
+    // Send the signal to wake up the thread
     state.cond.signal();
 
-    // 3. Ждем завершения потока
+    // 3. Wait for the thread to finish
     thread.join();
 
-    // Проверяем, что фоновый поток успешно проснулся и изменил счетчик
+    // Check that the background thread woke up and updated the counter
     try std.testing.expectEqual(@as(i32, 42), state.counter);
 }

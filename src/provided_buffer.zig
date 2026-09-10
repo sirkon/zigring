@@ -28,9 +28,13 @@ comptime {
 pub const ProvidedBufferPool = struct {
     const Self = @This();
 
-    // rawhugePages reserved bits taken from the io_uring_buf_ring header.
-    // The element array physically starts immediately after that header.
-    const bufsOffset = @sizeOf(io_uring_buf_ring);
+    // Kernel io_uring_buf_ring is a union: the io_uring_buf element
+    // array overlays the 16-byte header, so bufs[0] starts at offset 0
+    // and its fields alias resv1/resv2/resv3/tail. The tail (u16 at
+    // offset 14) is shared with bufs[0].resv, which the kernel never
+    // reads, so writing the tail is harmless. The ring mapping is
+    // entries * sizeof(io_uring_buf) bytes, no separate header.
+    const bufsOffset = 0;
     // 2 MiB huge page size.
     const hugePageSize: usize = 1 << 21;
     const hugePageMask: u32 = 21 << 26;
@@ -136,18 +140,18 @@ pub const ProvidedBufferPool = struct {
 
     /// Map the buffer ring, preferring 2 MiB huge pages and falling
     /// back to regular 4096-byte pages.
-    fn mmapRing(entries: u32) MMapError![]align(posix.page_size_min) u8 {
+    fn mmapRing(entries: u32) MMapError![]align(std.heap.pageSize()) u8 {
         const rawRingSize = bufsOffset + (entries * @sizeOf(linux.io_uring_buf));
         return mmapPool(rawRingSize);
     }
 
     /// Map the data backing of all buffers.
-    fn mmapBacking(entries: u32, bufferSize: u32) MMapError![]align(posix.page_size_min) u8 {
+    fn mmapBacking(entries: u32, bufferSize: u32) MMapError![]align(std.heap.pageSize()) u8 {
         const rawDataSize = @as(usize, entries) * bufferSize;
         return mmapPool(rawDataSize);
     }
 
-    fn mmapPool(rawSize: usize) MMapError![]align(posix.page_size_min) u8 {
+    fn mmapPool(rawSize: usize) MMapError![]align(std.heap.pageSize()) u8 {
         const prot = linux.PROT{ .READ = true, .WRITE = true };
 
         // First try huge pages: SHARED | ANONYMOUS | HUGETLB with the
@@ -190,7 +194,7 @@ pub const ProvidedBufferPool = struct {
         }
 
         const mask = self.bufRingEntries - 1;
-        const tail = @atomicLoad(u16, &self.bufRing.tail, .relaxed);
+        const tail = @atomicLoad(u16, &self.bufRing.tail, .acquire);
 
         // The element array sits strictly after the io_uring_buf_ring header.
         const basePtr = @intFromPtr(self.bufRing) + bufsOffset;
@@ -205,6 +209,7 @@ pub const ProvidedBufferPool = struct {
                 .addr = @intFromPtr(self.memoryBacking.ptr + offset),
                 .len = self.bufferSize,
                 .bid = @intCast(i),
+                .resv = 0,
             };
         }
 
@@ -222,25 +227,47 @@ pub const ProvidedBufferPool = struct {
             @branchHint(.cold);
             return;
         }
+        const idx = @as(usize, bid);
+        if (idx >= self.bufRingEntries) {
+            @branchHint(.cold);
+            return;
+        }
 
         const mask = self.bufRingEntries - 1;
 
         // The tail is only written by our userspace thread.
-        const tail = @atomicLoad(u16, &self.bufRing.tail, .relaxed);
+        const tail = @atomicLoad(u16, &self.bufRing.tail, .acquire);
 
         const basePtr = @intFromPtr(self.bufRing) + bufsOffset;
         const bufsPtr: [*]linux.io_uring_buf = @ptrFromInt(basePtr);
 
         const slotIdx = tail & mask;
-        const offset = @as(usize, bid) * self.bufferSize;
+        const offset = idx * self.bufferSize;
 
         bufsPtr[slotIdx] = .{
             .addr = @intFromPtr(self.memoryBacking.ptr + offset),
             .len = self.bufferSize,
             .bid = bid,
+            .resv = 0,
         };
 
         @atomicStore(u16, &self.bufRing.tail, tail +% 1, .release);
+    }
+
+    /// Return buffer slice for the given idx.
+    pub fn buffer(self: *Self, bid: u16) ![]u8 {
+        if (self.notInitalized) {
+            @branchHint(.cold);
+            return error.SizeClassNotInitialized;
+        }
+        const idx = @as(usize, bid);
+        if (idx >= self.bufRingEntries) {
+            @branchHint(.cold);
+            return error.InvalidBufferIndex;
+        }
+
+        const offset = idx * self.bufferSize;
+        return self.memoryBacking[offset .. offset + self.bufferSize];
     }
 
     /// Checks if this buffer pool is initialized.

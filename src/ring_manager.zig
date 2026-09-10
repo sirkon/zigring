@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const Uring = @import("iouring.zig").Ring;
+const Ring = @import("iouring.zig").Ring;
 const pthread = @import("pthread.zig");
 
 pub const WeightedRingManager = struct {
@@ -39,9 +39,9 @@ pub const WeightedRingManager = struct {
         self.groups.deinit(self.allocator);
     }
 
-    /// Потокобезопасный метод запроса нового кольца с указанным "весом"
-    pub fn acquireRing(self: *Self, queueDepth: u32, weight: u32) !Uring {
-        // Блокируем мьютекс на входе. Сбросится автоматически при выходе из функции (Scope-based)
+    /// Thread-safe method to request a new ring with the given "weight"
+    pub fn acquireRing(self: *Self, queueDepth: u32, weight: u32) !Ring {
+        // Lock the mutex on entry. Released automatically when leaving the function (scope-based)
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -64,7 +64,7 @@ pub const WeightedRingManager = struct {
             (self.groups.items.len < self.maxPollerThreads and minWeightFound > 0))
         {
             // Create a new master thread.
-            const ring = try Uring.init(queueDepth, null);
+            const ring = try Ring.init(queueDepth, null);
 
             // Register new group of rings for the master thread.
             try self.groups.append(self.allocator, .{
@@ -80,7 +80,7 @@ pub const WeightedRingManager = struct {
         // and we must attach a new ring to the existing kernel thread.
         const targetGroup = &self.groups.items[bestGroupIdx.?];
 
-        const ring = try Uring.init(
+        const ring = try Ring.init(
             queueDepth,
             targetGroup.masterFd,
         );
