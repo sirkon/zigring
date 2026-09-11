@@ -4,7 +4,7 @@ const E = linux.E;
 const posix = std.posix;
 const BufferPool = @import("provided_buffer.zig").ProvidedBufferPool;
 
-pub const page_size: usize = 4096;
+pub const pageSize: usize = 4096;
 pub const fireAndForgetTaskIdx: u64 = std.math.maxInt(u64);
 
 pub const BufferSizeClass = enum(u16) {
@@ -146,9 +146,9 @@ pub const Ring = struct {
     fd: posix.fd_t,
     flags: u32,
 
-    sqMmapPtr: []align(page_size) u8,
+    sqMmapPtr: []align(pageSize) u8,
     cqMmapPtr: []align(4096) u8, // Using literal page_size alignment
-    sqesMapPtr: []align(page_size) u8,
+    sqesMapPtr: []align(pageSize) u8,
 
     sqHead: *u32,
     sqTail: *u32,
@@ -375,7 +375,7 @@ pub const Ring = struct {
         return posix.mmap(null, hugeSize, prot, @bitCast(hugeFlags), -1, 0) catch blk: {
             // No huge pages configured in the OS: transparently fall back
             // to a plain anonymous mapping.
-            const regularSize = std.mem.alignForward(usize, rawSize, page_size);
+            const regularSize = std.mem.alignForward(usize, rawSize, pageSize);
             break :blk try posix.mmap(
                 null,
                 regularSize,

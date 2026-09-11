@@ -201,6 +201,47 @@ pub fn Slots(comptime T: type) type {
                 }
             }
         }
+
+        /// Returns true when no slot in this table is currently allocated.
+        ///
+        /// Child tables are never consulted: a child has no children of its
+        /// own, so the root slot array is the whole story.
+        fn isEmpty(self: Self) bool {
+            for (self.slots) |slot| {
+                if (slot.exists) return false;
+            }
+            return true;
+        }
+
+        /// Releases trailing child tables that hold no live values.
+        ///
+        /// Only the trailing run of unused children is dropped: the root table
+        /// and every child at or below the last child that still holds a value
+        /// are left alone, including unused children that appear before it. A
+        /// child is unused when every one of its slots has been deleted.
+        /// Dropped tables are recreated lazily by `add` if they are needed
+        /// again, reusing the same global indices.
+        pub fn dropUnused(self: *Self) void {
+            const childrenSlice = self.children orelse return;
+
+            // Walk backwards to the last child that still holds a value.
+            var keep: usize = childrenSlice.len;
+            while (keep > 0) {
+                if (childrenSlice[keep - 1]) |child| {
+                    if (!child.isEmpty()) break;
+                }
+                keep -= 1;
+            }
+
+            var i = keep;
+            while (i < childrenSlice.len) : (i += 1) {
+                if (childrenSlice[i]) |child| {
+                    child.deinit();
+                    self.allocator.destroy(child);
+                    childrenSlice[i] = null;
+                }
+            }
+        }
     };
 }
 
@@ -393,6 +434,7 @@ pub const BufferSlots = struct {
                 }
             }
         }
+
         return null;
     }
 
@@ -422,6 +464,47 @@ pub const BufferSlots = struct {
                 if (childrenSlice[childI]) |child| {
                     child.del(childLocalIdx);
                 }
+            }
+        }
+    }
+
+    /// Returns true when no slot in this table is currently allocated.
+    ///
+    /// Child tables are never consulted: a child has no children of its own,
+    /// so the root `exists` array is the whole story.
+    fn isEmpty(self: Self) bool {
+        for (self.exists) |exists| {
+            if (exists) return false;
+        }
+        return true;
+    }
+
+    /// Releases trailing child tables that hold no live values.
+    ///
+    /// Only the trailing run of unused children is dropped: the root table and
+    /// every child at or below the last child that still holds a value are left
+    /// alone, including unused children that appear before it. A child is
+    /// unused when every one of its slots has been deleted. Dropped tables are
+    /// recreated lazily by `addSlot`/`alloc` if they are needed again, reusing
+    /// the same global indices.
+    pub fn dropUnused(self: *Self) void {
+        const childrenSlice = self.children orelse return;
+
+        // Walk backwards to the last child that still holds a value.
+        var keep: usize = childrenSlice.len;
+        while (keep > 0) {
+            if (childrenSlice[keep - 1]) |child| {
+                if (!child.isEmpty()) break;
+            }
+            keep -= 1;
+        }
+
+        var i = keep;
+        while (i < childrenSlice.len) : (i += 1) {
+            if (childrenSlice[i]) |child| {
+                child.deinit();
+                self.allocator.destroy(child);
+                childrenSlice[i] = null;
             }
         }
     }
@@ -458,6 +541,104 @@ test "test slots" {
     slots.del(firstIdx);
     try testing.expectEqual(firstIdx, try slots.add(321));
     try testing.expectEqual(321, try must(slots.get(firstIdx)));
+}
+
+test "test slots dropUnused" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var slots = try Slots(u64).init(arena.allocator(), 4096, 3);
+
+    // Fill the root and the first two children: 0..4095, 4096..8191 and
+    // 8192..12287, all with matching values.
+    for (0..4096 * 3) |i| {
+        const idx = try slots.add(i);
+        try testing.expectEqual(@as(u64, i), idx);
+    }
+
+    // A live value in the third child.
+    const live = try slots.add(999);
+    try testing.expectEqual(@as(u64, 12288), live);
+
+    // Empty out the first child. It is unused but sits below a live child, so
+    // later trims must leave it in place.
+    for (4096..8192) |idx| {
+        slots.del(idx);
+    }
+
+    slots.dropUnused();
+    try testing.expect(slots.children.?[0] != null);
+    try testing.expect(slots.children.?[1] != null);
+    try testing.expect(slots.children.?[2] != null);
+
+    // The third child is now unused while the second still holds values: only
+    // the trailing third child goes, the empty first child stays.
+    slots.del(live);
+    slots.dropUnused();
+    try testing.expect(slots.children.?[0] != null);
+    try testing.expect(slots.children.?[1] != null);
+    try testing.expect(slots.children.?[2] == null);
+
+    // With every child unused, they all go.
+    for (8192..12288) |idx| {
+        slots.del(idx);
+    }
+    slots.dropUnused();
+    try testing.expect(slots.children.?[0] == null);
+    try testing.expect(slots.children.?[1] == null);
+    try testing.expect(slots.children.?[2] == null);
+
+    // The allocator still works and reuses the first child.
+    const reused = try slots.add(7);
+    try testing.expectEqual(@as(u64, 4096), reused);
+    try testing.expectEqual(7, try must(slots.get(reused)));
+}
+
+test "test buffer slots dropUnused" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var slots = try BufferSlots.init(arena.allocator(), 4096, 16, 3);
+
+    // Fill the root and the first two children with 16-byte buffers.
+    for (0..4096 * 3) |i| {
+        const idx = try slots.alloc();
+        try testing.expectEqual(@as(u64, i), idx);
+    }
+
+    const live = try slots.alloc();
+    try testing.expectEqual(@as(u64, 12288), live);
+
+    for (4096..8192) |idx| {
+        slots.del(idx);
+    }
+
+    slots.dropUnused();
+    try testing.expect(slots.children.?[0] != null);
+    try testing.expect(slots.children.?[1] != null);
+    try testing.expect(slots.children.?[2] != null);
+
+    slots.del(live);
+    slots.dropUnused();
+    try testing.expect(slots.children.?[0] != null);
+    try testing.expect(slots.children.?[1] != null);
+    try testing.expect(slots.children.?[2] == null);
+
+    for (8192..12288) |idx| {
+        slots.del(idx);
+    }
+    slots.dropUnused();
+    try testing.expect(slots.children.?[0] == null);
+    try testing.expect(slots.children.?[1] == null);
+    try testing.expect(slots.children.?[2] == null);
+
+    const reused = try slots.alloc();
+    try testing.expectEqual(@as(u64, 4096), reused);
+    try testing.expect(slots.get(reused) != null);
 }
 
 fn must(v: ?u64) !u64 {

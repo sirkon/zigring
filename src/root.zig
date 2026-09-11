@@ -64,7 +64,7 @@ pub const BatchCQ = ring.BatchCQ;
 pub const ReorderBuffer = ring.ReorderBuffer;
 
 /// The page size, in bytes, assumed when mmapping pools.
-pub const page_size = ring.page_size;
+pub const pageSize = ring.pageSize;
 
 /// The task index reserved for operations whose completion is not awaited.
 pub const fireAndForgetTaskIdx = ring.fireAndForgetTaskIdx;
