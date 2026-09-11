@@ -18,7 +18,7 @@ test "SendZC sends a slice of a registered buffer" {
     defer ring.deinit();
 
     // Set up a connected TCP loopback pair on the same ring.
-    const listenFd = try sockets.createServerSocket();
+    const listenFd = try sockets.createTCPServerSocket();
     defer _ = linux.close(listenFd);
 
     try ring.pushBindIp4(listenFd, 1, "127.0.0.1", 60011, .{});
@@ -28,7 +28,7 @@ test "SendZC sends a slice of a registered buffer" {
 
     try ring.pushAccept(listenFd, 2, .{});
 
-    const clientFd = try sockets.createClientSocket();
+    const clientFd = try sockets.createTCPClientSocket(null);
     defer _ = linux.close(clientFd);
 
     try ring.pushConnectIp4(clientFd, 3, "127.0.0.1", 60011, .{});
@@ -37,7 +37,7 @@ test "SendZC sends a slice of a registered buffer" {
     var connected = false;
     while (serverFd < 0 or !connected) {
         const cqe = try wait(&ring);
-        switch (cqe.taskIdx) {
+        switch (cqe.taskIdx()) {
             2 => if (cqe.res >= 0) {
                 serverFd = cqe.res;
             },
@@ -78,18 +78,18 @@ test "SendZC sends a slice of a registered buffer" {
 
     while (!(gotSendFirst and gotNotif and gotRecv)) {
         const cqe = try wait(&ring);
-        if (cqe.taskIdx == sendTaskIdx) {
-            if (cqe.hasNotif) {
+        if (cqe.taskIdx() == sendTaskIdx) {
+            if (cqe.hasNotif()) {
                 gotNotif = true;
             } else {
                 try std.testing.expect(cqe.res >= 0);
                 try std.testing.expectEqual(@as(i32, @intCast(payload.len)), cqe.res);
-                try std.testing.expect(cqe.hasMore);
+                try std.testing.expect(cqe.hasMore());
                 gotSendFirst = true;
             }
-        } else if (cqe.taskIdx == recvTaskIdx) {
-            try std.testing.expect(!cqe.hasNotif);
-            const recvBuf = ring.buffer(.tiny, cqe.bid) orelse return error.MissingRecvBuffer;
+        } else if (cqe.taskIdx() == recvTaskIdx) {
+            try std.testing.expect(!cqe.hasNotif());
+            const recvBuf = ring.buffer(.tiny, cqe.bid()) orelse return error.MissingRecvBuffer;
             try std.testing.expectEqualStrings(payload, recvBuf[0..cqe.result()]);
             gotRecv = true;
         }

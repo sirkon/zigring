@@ -1,34 +1,36 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-/// Возвращает текущее время Unix в наносекундах (u64) напрямую через сисколл.
-/// Никаких аллокаторов, никаких контекстов Io, чистый vDSO-Fastpath ядра.
+inline fn toUnixNs(ts: linux.timespec) u64 {
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// Returns the current Unix time in nanoseconds (u64).
+/// Uses the vDSO implementation of clock_gettime: on the fast path the kernel is not
+/// crossed; if vDSO is unavailable, Zig falls back to a regular syscall.
 pub inline fn nowNs() u64 {
-    // Явно объявляем структуру timespec из ABI Linux (секунды + наносекунды)
     var ts: linux.timespec = undefined;
 
-    // В Linux ABI: CLOCK_REALTIME = 0
-    // Вызываем сисколл напрямую через встроенный ассемблерный шлюз Zig
-    const res = linux.syscall2(.clock_gettime, 0, @intFromPtr(&ts));
+    const res = linux.clock_gettime(.REALTIME, &ts);
 
-    // Если сисколл отработал успешно (вернул 0)
     if (res == 0) {
         @branchHint(.likely);
-        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        return toUnixNs(ts);
     }
 
-    // Холодная ветка на случай, если вселенная сломалась
+    // Cold branch in case the universe broke
     return 0;
 }
 
-/// Монотонное время для внутренних замеров дельты Latency.
-/// В Linux ABI: CLOCK_MONOTONIC = 1
+/// Monotonic time for internal Latency delta measurements.
 pub inline fn monotonicNs() u64 {
     var ts: linux.timespec = undefined;
-    const res = linux.syscall2(.clock_gettime, 1, @intFromPtr(&ts));
+
+    const res = linux.clock_gettime(.MONOTONIC, &ts);
+
     if (res == 0) {
         @branchHint(.likely);
-        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        return toUnixNs(ts);
     }
 
     return 0;
@@ -37,19 +39,19 @@ pub inline fn monotonicNs() u64 {
 test "times" {
     const start = nowNs();
 
-    // Спим 1 миллисекунду (1_000_000 нс)
+    // Sleep for 1 millisecond (1_000_000 ns)
     try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake);
 
     const elapsed = nowNs() - start;
     std.debug.print("Real elapsed ns: {}\n", .{elapsed});
 
-    // Проверяем, что мы поспали около 1 мс с допуском ±200_000 наносекунд (на погрешность ОС)
+    // Check that we slept about 1 ms with a ±200_000 nanosecond tolerance (for OS jitter)
     const expected_ns: i64 = 1_000_000;
     var diff = @as(i64, @intCast(elapsed)) - expected_ns;
     if (diff < 0) {
         diff = -diff;
     }
 
-    // Абсолютная дельта должна быть меньше 200 микросекунд
+    // The absolute delta must be less than 200 microseconds
     try std.testing.expect(diff < 200_000);
 }

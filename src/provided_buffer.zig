@@ -120,10 +120,9 @@ pub const ProvidedBufferPool = struct {
             .memoryBackingMmap = backingSize,
         };
 
-        // Initially fill the ring with buffers.
+        // Publish every buffer to the kernel before the ring is handed back,
+        // so buffer-select operations never start from an empty pool.
         self.replenishAll();
-
-        // Cr
 
         return self;
     }

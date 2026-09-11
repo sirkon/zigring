@@ -4,7 +4,7 @@ const linux = std.os.linux;
 const Ring = @import("iouring.zig").Ring;
 const pthread = @import("pthread.zig");
 
-pub const WeightedRingManager = struct {
+pub const Factory = struct {
     const Self = @This();
 
     // Maximal amount of poller threads available.

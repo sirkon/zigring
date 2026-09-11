@@ -72,14 +72,46 @@ pub const TaskFlags = packed struct(u8) {
     }
 };
 
-/// CQE is a type returned by popCQE method.
-pub const CQE = struct {
-    taskIdx: u64,
+/// A completion read from the CQ by `popCQE` (or `BatchCQ.popCQE`).
+///
+/// It mirrors the kernel's `struct io_uring_cqe` byte-for-byte (`user_data`,
+/// `res`, `flags`), so it can overlay the CQ ring directly. Everything the
+/// kernel encodes inside `flags` is exposed through methods: `taskIdx` returns
+/// `user_data`, `hasBuffer`/`hasMore`/`hasNotif` decode the CQE flag bits,
+/// `bid` extracts the provided buffer id, and `errno`/`result` interpret `res`.
+pub const CQE = extern struct {
+    /// User data supplied when the operation was pushed; identifies it.
+    user_data: u64,
+    /// Raw syscall result: non-negative size/success, or a negative errno.
     res: i32,
-    bid: u16,
-    hasBuffer: bool,
-    hasMore: bool,
-    hasNotif: bool,
+    /// Raw kernel `IORING_CQE_F_*` flags, with the provided buffer id in the
+    /// upper 16 bits.
+    flags: u32,
+
+    /// User data supplied when the operation was pushed; identifies it.
+    pub inline fn taskIdx(self: CQE) u64 {
+        return self.user_data;
+    }
+
+    /// Provided buffer id, valid when `hasBuffer` returns true.
+    pub inline fn bid(self: CQE) u16 {
+        return @intCast(self.flags >> 16);
+    }
+
+    /// True when the kernel selected a provided buffer (buffer-select ops).
+    pub inline fn hasBuffer(self: CQE) bool {
+        return (self.flags & 1) != 0;
+    }
+
+    /// True when a multishot operation is still armed and more CQEs follow.
+    pub inline fn hasMore(self: CQE) bool {
+        return (self.flags & 2) != 0;
+    }
+
+    /// True for the second CQE of a `SEND_ZC`: the buffer may be reused now.
+    pub inline fn hasNotif(self: CQE) bool {
+        return (self.flags & 8) != 0;
+    }
 
     /// Return errno for given res.
     pub inline fn errno(self: CQE) linux.E {
@@ -93,7 +125,21 @@ pub const CQE = struct {
     }
 };
 
-/// A wrapper for io_uring ring with kernel poller.
+/// A single io_uring instance configured with SQPOLL, so a dedicated kernel
+/// thread polls the submission queue.
+///
+/// The ring owns three mmaps (the SQ ring, the SQE array and the CQ ring) plus
+/// the ring fd; `deinit` releases them all. Work is submitted with the `push*`
+/// family, which writes an SQE and only wakes the kernel when needed, and
+/// results are read back with `popCQE` or `batchedCQ`.
+///
+/// The kernel reads operation arguments (buffers, paths, timespecs) from the
+/// SQE asynchronously, so every pointer handed to a `push*` must stay valid
+/// until the matching completion has been consumed.
+///
+/// A ring is not synchronized: do not call the `push*` methods or `popCQE`
+/// concurrently on the same instance from several threads unless you add your
+/// own locking. Use one ring per submitting thread.
 pub const Ring = struct {
     const Self = @This(); // Exact type mapping verified
 
@@ -113,12 +159,26 @@ pub const Ring = struct {
     cqHead: *u32,
     cqTail: *u32,
     cqMask: u32,
-    cqEntries: [*]linux.io_uring_cqe,
+    cqEntries: [*]CQE,
 
     bufPools: [@typeInfo(BufferSizeClass).@"enum".fields.len]BufferPool =
         [_]BufferPool{undefined} ** @typeInfo(BufferSizeClass).@"enum".fields.len,
 
-    /// Creates and initializes a new ring.
+    /// Creates a ring by calling `io_uring_setup` and mmapping the SQ ring, the
+    /// SQE array and the CQ ring.
+    ///
+    /// `queueDepth` is the number of SQ entries and must be a power of two,
+    /// otherwise `error.ZigRingRequiresDepthPowOf2` is returned. The ring runs
+    /// with SQPOLL, so its kernel thread polls the SQ and parks itself after one
+    /// second idle; submissions normally cost no syscall.
+    ///
+    /// When `attachFd` is non-null, this ring shares the kernel polling thread
+    /// of the ring with that fd (`IORING_SETUP_ATTACH_WQ`) instead of starting
+    /// its own. That is how several rings can be served by one poller; the
+    /// referenced ring must outlive this one.
+    ///
+    /// The caller owns the returned value and must call `deinit` to unmap the
+    /// regions and close the fd.
     pub fn init(queueDepth: u32, attachFd: ?posix.fd_t) !Self {
         if (@popCount(queueDepth) != 1) {
             return error.ZigRingRequiresDepthPowOf2;
@@ -160,7 +220,7 @@ pub const Ring = struct {
             linux.IORING_OFF_SQES,
         );
 
-        const cqLen = params.cq_off.cqes + (params.cq_entries * @sizeOf(linux.io_uring_cqe));
+        const cqLen = params.cq_off.cqes + (params.cq_entries * @sizeOf(CQE));
         const cqMmap = try posix.mmap(
             null,
             cqLen,
@@ -197,6 +257,13 @@ pub const Ring = struct {
         };
     }
 
+    /// Releases everything the ring owns: unmaps the SQ ring, the SQE array and
+    /// the CQ ring, closes the ring fd, and tears down every provided buffer
+    /// pool registered with `regiterSizeClassReceiveBuffer`.
+    ///
+    /// After this the ring is invalid and must not be used again. This does not
+    /// free the memory returned by `registerBuffers`: that mapping is owned by
+    /// the caller and must be released with `posix.munmap`.
     pub fn deinit(self: *Self) void {
         posix.munmap(self.sqMmapPtr);
         posix.munmap(self.sqesMapPtr);
@@ -207,6 +274,17 @@ pub const Ring = struct {
         }
     }
 
+    /// Registers a kernel-provided buffer ring (a "buffer pool") for one size
+    /// class, so the kernel can pick buffers for buffer-select operations on
+    /// this ring.
+    ///
+    /// `entries` buffers of `sizeClass.size()` bytes are mmapped (preferring
+    /// 2 MiB huge pages) and published to the kernel; `entries` must be a power
+    /// of two. At most one pool per size class may exist: a second call for the
+    /// same class returns `error.BufferOfSizeAlreadyInitialized`.
+    ///
+    /// The pool backs `pushReadZC`/`pushRecvZC`/`pushRecvMultishotZC` for that
+    /// class and is owned and freed by the ring itself, not by the caller.
     pub fn regiterSizeClassReceiveBuffer(self: *Self, sizeClass: BufferSizeClass, entries: u32) !void {
         const idx = @intFromEnum(sizeClass);
         const bufPool = &self.bufPools[idx];
@@ -223,14 +301,21 @@ pub const Ring = struct {
 
     const MMapError = posix.MMapError;
 
-    /// Allocates an area of `entries` buffers of the given size class on huge
-    /// pages (with a regular-page fallback), registers it into io_uring and
-    /// returns the backing memory as a flat, page-aligned []u8.
+    /// Allocates and registers a flat region of `entries` buffers of
+    /// `sizeClass` as io_uring fixed buffers, then returns the mapping.
     ///
-    /// The returned slice is an mmap mapping, so release it with posix.munmap.
-    /// Its length is rounded up to the mmap page size (2 MiB when huge pages
-    /// are available), which may exceed sizeClass.size() * entries. Only the
-    /// first sizeClass.size() * entries bytes are used as buffers.
+    /// These are the buffers referenced by index in `pushSendZC`: buffer `i`
+    /// starts at offset `i * sizeClass.size()`. The region is allocated on huge
+    /// pages with a regular-page fallback, so its length is rounded up to the
+    /// mapping page size (2 MiB when huge pages are available) and may exceed
+    /// `sizeClass.size() * entries`; only the first `sizeClass.size() * entries`
+    /// bytes are registered.
+    ///
+    /// Ownership: the returned slice is a raw mmap owned by the caller and must
+    /// be released with `posix.munmap`. The kernel pins these pages while the
+    /// registration is live, so do not unmap them until every in-flight
+    /// `pushSendZC` using them has completed. Closing the ring fd in `deinit`
+    /// releases the registration itself.
     pub fn registerBuffers(self: *Self, sizeClass: BufferSizeClass, entries: u32) ![]align(std.heap.pageSize()) u8 {
         const buf_size = sizeClass.size();
         const total = @as(usize, buf_size) * entries;
@@ -367,6 +452,13 @@ pub const Ring = struct {
         return .{ .ring = self, .head = head, .tail = tail };
     }
 
+    /// Submits a plain file write (`IORING_OP.WRITE`) of `len` bytes from
+    /// `dataPtr` to `targetFd`, at the file's current offset.
+    ///
+    /// The kernel reads `dataPtr` asynchronously, so that buffer must stay
+    /// valid and unchanged until the matching completion arrives. `taskIdx` is
+    /// opaque user data echoed back in the resulting `CQE` to identify the
+    /// operation. A short write is possible, so check `CQE.result()`.
     pub inline fn pushWrite(
         self: *Self,
         targetFd: posix.fd_t,
@@ -388,6 +480,12 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
+    /// Submits a socket send (`IORING_OP.SEND`) of `len` bytes from `dataPtr` to
+    /// `targetFd`.
+    ///
+    /// `dataPtr` must stay valid until the matching completion, exactly like
+    /// `pushWrite`. For zero-copy sending use `pushSendZC`. `taskIdx` is echoed
+    /// in the resulting `CQE`.
     pub inline fn pushSend(
         self: *Self,
         targetFd: posix.fd_t,
@@ -416,11 +514,11 @@ pub const Ring = struct {
     /// backs `dataPtr`, and `dataPtr`/`len` may select any part of it: the
     /// kernel pins the pages once and hands them to the network stack instead
     /// of copying the payload, so the buffer must not be modified or reused
-    /// until the matching completion with `CQE.hasNotif` set arrives.
+    /// until the matching completion with `CQE.hasNotif()` set arrives.
     ///
     /// A successful request produces two completions: the first carries the
-    /// number of bytes queued (`CQE.hasMore` is set), the second is the
-    /// notification that frees the buffer for reuse (`CQE.hasNotif` is set).
+    /// number of bytes queued (`CQE.hasMore()` is set), the second is the
+    /// notification that frees the buffer for reuse (`CQE.hasNotif()` is set).
     ///
     /// `msgFlags` are the regular `MSG_*` flags (e.g. `MSG_NOSIGNAL`).
     pub inline fn pushSendZC(
@@ -451,6 +549,18 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
+    /// Submits a read (`IORING_OP.READ`) that lets the kernel pick a buffer from
+    /// the provided pool registered for `size`, instead of using a caller
+    /// buffer.
+    ///
+    /// The size class must already be registered with
+    /// `regiterSizeClassReceiveBuffer`, otherwise
+    /// `error.BufferPoolNotInitialized` is returned.
+    ///
+    /// The chosen buffer is reported in the completion: `CQE.hasBuffer()` is set
+    /// and `CQE.bid()` identifies it. The kernel does not reclaim it
+    /// automatically, so call `releaseBuffer` once done, otherwise the pool
+    /// drains. Fetch its bytes with `buffer(size, bid)`.
     pub inline fn pushReadZC(
         self: *Self,
         targetFd: posix.fd_t,
@@ -477,6 +587,40 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
+    /// Submits a read (`IORING_OP.READ`) of up to `dst.len` bytes from
+    /// `targetFd` into the caller-owned `dst`, at the file's current offset.
+    ///
+    /// `dst` must stay valid until the matching completion. A short read is
+    /// possible, so check `CQE.result()`. `taskIdx` is echoed in the `CQE`.
+    pub inline fn pushRead(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        dst: []u8,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.READ;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(dst.ptr);
+        sqe.len = @intCast(dst.len);
+        sqe.flags = flags.flags();
+        sqe.user_data = taskIdx;
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Submits a single socket receive (`IORING_OP.RECV`) that fills a buffer
+    /// the kernel picks from the provided pool registered for `size`.
+    ///
+    /// The size class must be registered first
+    /// (`regiterSizeClassReceiveBuffer`), otherwise
+    /// `error.BufferPoolNotInitialized` is returned. The borrowed buffer is
+    /// reported through `CQE.hasBuffer()`/`CQE.bid()` and must be returned to the
+    /// pool with `releaseBuffer` after use. Use `pushRecvMultishotZC` when one
+    /// submission should keep receiving.
     pub inline fn pushRecvZC(
         self: *Self,
         targetFd: posix.fd_t,
@@ -503,6 +647,41 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
+    /// Submits a single socket receive (`IORING_OP.RECV`) of up to `buf.len`
+    /// bytes into the caller-owned `buf`.
+    ///
+    /// `buf` must stay valid until the matching completion; the number of bytes
+    /// received is in `CQE.result()`. `taskIdx` is echoed in the `CQE`.
+    pub inline fn pushRecv(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        buf: []u8,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.RECV;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(buf.ptr);
+        sqe.len = @intCast(buf.len);
+        sqe.flags = flags.flags();
+        sqe.user_data = taskIdx;
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Arms a multishot receive (`IORING_OP.RECV` with `IORING_RECV_MULTISHOT`)
+    /// that keeps producing completions without being re-submitted.
+    ///
+    /// Each completion with `CQE.hasMore()` set means the receive is still armed,
+    /// and every one of them carries a borrowed provided buffer via
+    /// `CQE.hasBuffer()`/`CQE.bid()` that the caller must `releaseBuffer` once
+    /// processed. The multishot ends on an error (for example `-ENOBUFS` once
+    /// the pool is drained) or when the operation is canceled; the final `CQE`
+    /// then clears `hasMore`. Only one multishot receive may be armed per fd at
+    /// a time, a second attempt fails with `-EBUSY`.
     pub inline fn pushRecvMultishotZC(
         self: *Self,
         targetFd: posix.fd_t,
@@ -529,8 +708,16 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
-    /// Asynchronously opens a directory relative to the base folder (with the O_PATH flag).
-    /// A valid folder `fd` will arrive in the `res` field of `popCQE`.
+    /// Asynchronously opens a subdirectory relative to `baseDirFd`
+    /// (`IORING_OP.OPENAT` with `O_PATH`).
+    ///
+    /// `subPath` is a NUL-terminated path relative to `baseDirFd`; both it and
+    /// `baseDirFd` must be valid until the operation completes, because the
+    /// kernel reads them asynchronously. The request is forced to the io-wq
+    /// workers, since opening can block on the VFS.
+    ///
+    /// On success the completion's `res` is a new `O_PATH` fd for the
+    /// directory, owned by the caller and to be closed later with `pushClose`.
     pub inline fn pushOpenDir(
         self: *Self,
         taskIdx: u64,
@@ -561,8 +748,17 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
-    /// Asynchronously opens or creates a session file inside the given directory.
-    /// The opened file descriptor will arrive in the `res` field of `popCQE`.
+    /// Asynchronously opens or creates a file inside `dirFd`
+    /// (`IORING_OP.OPENAT`).
+    ///
+    /// `dirFd` is a directory fd (for example one returned by `pushOpenDir`) and
+    /// `fileName` is a NUL-terminated name relative to it; the name must stay
+    /// valid until the operation completes. `opts` are the `open(2)` flags,
+    /// with `O_CLOEXEC` always forced on. The request is offloaded to the io-wq
+    /// workers because opening can block.
+    ///
+    /// On success the completion's `res` is the new fd, owned by the caller and
+    /// to be closed later with `pushClose`.
     pub inline fn pushOpenFile(
         self: *Self,
         taskIdx: u64,
@@ -595,6 +791,12 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
+    /// Asynchronously closes `targetFd` (`IORING_OP.CLOSE`).
+    ///
+    /// `targetFd` must still be valid when the kernel processes the SQE. On
+    /// success the completion's `res` is 0, and the fd must not be used after
+    /// pushing the close. The request is offloaded to the io-wq workers because
+    /// closing can block.
     pub inline fn pushClose(
         self: *Self,
         taskIdx: u64,
@@ -612,8 +814,15 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
-    /// Runs an endless non-blocking accept of clients on the listening socket.
-    /// For every new connection a new client `fd` will arrive in the `res` field of `popCQE`.
+    /// Arms a multishot accept (`IORING_OP.ACCEPT` with
+    /// `IORING_ACCEPT_MULTISHOT`) on `listenFd`, which keeps delivering incoming
+    /// connections without being re-submitted.
+    ///
+    /// Every completion whose `res` is a valid fd is a freshly accepted client
+    /// socket (created with `O_CLOEXEC`); the caller owns it and must close it
+    /// with `pushClose`. As long as `CQE.hasMore()` is set the accept is still
+    /// armed; it stops on an error or when the operation is canceled, and the
+    /// final `CQE` clears `hasMore`.
     pub inline fn pushAcceptMultishot(
         self: *Self,
         listenFd: posix.fd_t,
@@ -642,7 +851,12 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
-    /// Run accept to catch incoming connections.
+    /// Submits a one-shot accept (`IORING_OP.ACCEPT`) on `listenFd`.
+    ///
+    /// `listenFd` must already be bound and listening. On success the
+    /// completion's `res` is a new client socket fd (created with `O_CLOEXEC`),
+    /// owned by the caller and to be closed with `pushClose`. To keep accepting
+    /// without resubmitting use `pushAcceptMultishot`.
     pub inline fn pushAccept(
         self: *Self,
         listenFd: posix.fd_t,
@@ -661,8 +875,16 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
-    /// Asynchronously and atomically renames a session file inside the base directory.
-    /// Guarantees log integrity across power failures.
+    /// Asynchronously renames a file within the directory `baseDirFd`
+    /// (`IORING_OP.RENAMEAT`).
+    ///
+    /// Both names are resolved relative to the same `baseDirFd` and the rename
+    /// is atomic in the VFS, which lets callers publish a fully written
+    /// temporary file under its final name.
+    ///
+    /// `oldName` and `newName` are NUL-terminated and must stay valid until the
+    /// operation completes. The request is forced to the io-wq workers because
+    /// renaming locks VFS metadata.
     pub inline fn pushRename(
         self: *Self,
         taskIdx: u64,
@@ -850,6 +1072,12 @@ pub const Ring = struct {
         try self.pushConnect(fd, user_data, @ptrCast(&sock_addr), @sizeOf(posix.sockaddr.in6), flags);
     }
 
+    /// Submits `listen(2)` (`IORING_OP.LISTEN`) on `socketFd`, marking it ready
+    /// to accept connections with `backlog` as the pending-connection hint.
+    ///
+    /// The socket must already be bound. The kernel clamps the usable backlog
+    /// to `net.core.somaxconn`, so the effective value may be lower than
+    /// requested; a successful completion has `res == 0`.
     pub inline fn pushListen(
         self: *Self,
         socketFd: posix.fd_t,
@@ -869,8 +1097,13 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
-    /// Generates a CQE event inside another io_uring using its file descriptor (targetRingFd).
-    /// Perfect for instantly waking up a sleeping thread-index from a background worker.
+    /// Sends a wakeup to another io_uring (`IORING_OP.MSG_RING`) identified by
+    /// `targetRingFd`, useful for waking a thread parked on that ring.
+    ///
+    /// The target ring receives a `CQE` whose `res` is `msgResult` and whose
+    /// `taskIdx` is this call's `taskIdx`, so the receiver can tell senders
+    /// apart. The operation is non-blocking and no completion is generated on
+    /// the sending ring (`SkipSuccess`), so nothing needs to be awaited here.
     pub inline fn pushMsgRing(
         self: *Self,
         targetRingFd: posix.fd_t, // fd of the ring belonging to the sleeping thread
@@ -897,11 +1130,19 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
-    /// Asynchronous timer. The thread will wake up and produce a CQE
-    /// when the specified time has elapsed (seconds + nanoseconds).
-    /// timespecPtr must remain valid in memory while the timer is ticking!
-    /// Beware, you should be really careful with skipSuccess in flags,
-    /// since it will lead to timespecPtr leak if it is not static.
+    /// Arms a standalone timer (`IORING_OP.TIMEOUT`) that produces a `CQE`
+    /// after the duration in `timespecPtr` elapses.
+    ///
+    /// The time is relative to submission unless the operation is flagged as
+    /// absolute, and the timeout is reported as success
+    /// (`IORING_TIMEOUT_ETIME_SUCCESS`), so an expired timer yields `res == 0`
+    /// rather than `-ETIME`.
+    ///
+    /// `timespecPtr` is read by the kernel while the timer runs, so it must
+    /// remain valid and unchanged until the completion is consumed. Take care
+    /// with `SkipSuccess`: suppressing the completion also hides the only
+    /// signal that the pointer is no longer needed, leaking it unless the
+    /// timespec is static.
     pub inline fn pushTimeout(
         self: *Self,
         taskIdx: u64,
@@ -930,11 +1171,19 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
-    /// Attaches a timeout to the previously submitted operation in the chain.
-    /// If the previous operation does not complete within timespecPtr, it will be canceled.
-    /// timespecPtr must remain valid in memory while the timer is ticking!
-    /// Beware, you should be really careful with skipSuccess in flags,
-    /// since it will lead to timespecPtr leak if it is not static.
+    /// Attaches a timeout (`IORING_OP.LINK_TIMEOUT`) that cancels the operation
+    /// immediately preceding it if that operation does not finish in time.
+    ///
+    /// The link is established only between SQEs submitted together, so for a
+    /// reliable guard push the guarded operation and this timeout in the same
+    /// `batchedSQ` batch; a bare ring push may lose the association and the
+    /// kernel then rejects the SQE with `-EINVAL`. On expiry the timeout is
+    /// reported as success (`IORING_TIMEOUT_ETIME_SUCCESS`), and the guard
+    /// counts exactly one operation.
+    ///
+    /// `timespecPtr` must remain valid and unchanged until the completion is
+    /// consumed. As with `pushTimeout`, be careful with `SkipSuccess`: hiding
+    /// the completion keeps the pointer live until it is known to be freeable.
     pub inline fn pushTimeoutForOp(
         self: *Self,
         timespecPtr: *const linux.kernel_timespec,
@@ -951,8 +1200,9 @@ pub const Ring = struct {
         // Pass the pointer to the time structure
         sqe.addr = @intFromPtr(timespecPtr);
 
-        // For linked timeouts, len must always be set to 0
-        sqe.len = 0;
+        // For linked timeouts the kernel requires the event count in len to
+        // be exactly 1, otherwise it rejects the SQE with -EINVAL.
+        sqe.len = 1;
 
         // Timer flags: using ETIME_SUCCESS so that a regular timeout is treated normally.
         // rw_flags maps directly to timeout_flags in the flat SQE structure.
@@ -965,6 +1215,15 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
+    /// Removes and returns the next completion, or null if the CQ is empty.
+    ///
+    /// `CQE.taskIdx()` identifies the operation and `CQE.res` is its result. When
+    /// `CQE.hasBuffer()` is set, `bid` is a borrowed provided buffer that must be
+    /// returned with `releaseBuffer` exactly once; for `pushSendZC` the buffer
+    /// is freed by the completion with `hasNotif` set. Consuming a completion
+    /// advances the CQ head and frees its slot for the kernel, so leaving
+    /// completions unread will eventually stall the CQ. Call this on the hot
+    /// path and fall back to `park` only when it returns null.
     pub inline fn popCQE(self: *Self) ?CQE {
         const head = self.cqHead.*;
         const tail = @atomicLoad(u32, self.cqTail, .acquire);
@@ -972,36 +1231,11 @@ pub const Ring = struct {
         if (head == tail) return null;
 
         const cqeIdx = head & self.cqMask;
-        const cqe = &self.cqEntries[cqeIdx];
-
-        const taskIdx = cqe.user_data;
-        const outRes = cqe.res;
-        const flags = cqe.flags;
-
-        // Bit 0 (1 << 0): the kernel selected a provided buffer from our pool
-        const hasBuffer = (flags & 1) != 0;
-
-        // Bit 1 (1 << 1): IORING_CQE_F_MORE. Multishot is active, the kernel will keep sending CQEs
-        const hasMore = (flags & 2) != 0;
-
-        // Bit 3 (1 << 3): IORING_CQE_F_NOTIF. This is the second CQE of a
-        // SEND_ZC request; it signals that the registered buffer may be reused.
-        const hasNotif = (flags & 8) != 0;
-
-        // Extract the Buffer ID from the upper 16 bits of the flags field (shift right by 16)
-        const bid = @as(u16, @intCast(flags >> 16));
 
         // Advance the ring head one at a time with .release semantics
         @atomicStore(u32, self.cqHead, head +% 1, .release);
 
-        return CQE{
-            .taskIdx = taskIdx,
-            .res = outRes,
-            .bid = bid,
-            .hasBuffer = hasBuffer,
-            .hasMore = hasMore,
-            .hasNotif = hasNotif,
-        };
+        return self.cqEntries[cqeIdx];
     }
 
     /// Opens a batched consumption window over the CQ. It snapshots the current
@@ -1020,12 +1254,21 @@ pub const Ring = struct {
         return .{ .ring = self, .head = head, .tail = tail };
     }
 
-    /// Puts the current thread-index to sleep until at least one CQE appears.
-    /// Called on the "cold" path when both the CQ and the software queue are empty.
+    /// Blocks the calling thread until at least one completion is available.
+    ///
+    /// This enters the kernel with `io_uring_enter`, requesting
+    /// `IORING_ENTER_GETEVENTS` with a minimum of one event and also passing
+    /// `IORING_ENTER_SQ_WAKEUP` so a parked SQPOLL thread resumes. No operation
+    /// is submitted, so it is safe to call when the SQ is empty.
+    ///
+    /// It is the cold-path companion to `popCQE`/`batchedCQ`: call it only after
+    /// they returned null, to avoid an unnecessary syscall in the hot path.
+    /// `EINTR` (for example from a profiler or debugger) is retried internally;
+    /// any other error is treated as fatal and panics.
     pub fn park(self: *Self) void {
-        // If SQPOLL is active in your MyUring, you need to add the IORING_ENTER_SQ_WAKEUP flag (1 << 1),
-        // in case the kernel poller also fell asleep due to an idle timeout.
-        // enter_flags |= 2;
+        // IORING_ENTER_SQ_WAKEUP (1 << 1) is always passed below: the SQPOLL
+        // thread parks itself after its idle timeout, so without the wakeup a
+        // sleep here could outlive the poller and never be interrupted.
 
         while (true) {
             // Direct system call to io_uring_enter without stdlib intermediaries
@@ -1055,10 +1298,27 @@ pub const Ring = struct {
         }
     }
 
+    /// Returns a provided buffer that the kernel handed out (a `CQE.bid()` with
+    /// `CQE.hasBuffer()` set) to the pool for `sizeClass`, making it reusable by
+    /// later buffer-select operations.
+    ///
+    /// Each borrowed buffer must be released exactly once. Forgetting to
+    /// release drains the pool, after which multishot receives fail with
+    /// `-ENOBUFS`; the pool is per size class and is not refilled
+    /// automatically. Out-of-range ids, or a pool that is not initialized, are
+    /// ignored.
     pub fn releaseBuffer(self: *Self, sizeClass: BufferSizeClass, bid: u16) void {
         self.bufPools[sizeClass.bgid()].releaseBuffer(bid);
     }
 
+    /// Returns the bytes of provided buffer `bid` from the pool for
+    /// `sizeClass`, or null if the pool is not initialized or `bid` is out of
+    /// range.
+    ///
+    /// The slice is a borrowed view into the pool's mmapped backing memory: it
+    /// stays valid until the buffer is released with `releaseBuffer` (and, more
+    /// generally, until the ring is deinitialized). Do not free it. For a given
+    /// completion only the first `CQE.result()` bytes hold data.
     pub fn buffer(self: *Self, sizeClass: BufferSizeClass, bid: u16) ?[]const u8 {
         var bufpool: BufferPool = self.bufPools[sizeClass.bgid()];
         return bufpool.buffer(bid) catch {
@@ -1106,6 +1366,9 @@ pub const BatchSQ = struct {
         return sqe;
     }
 
+    /// Reserves and fills a plain file write in the batch, mirroring
+    /// `Ring.pushWrite` (including the buffer lifetime requirement). Returns
+    /// null when the batch is full, in which case nothing was reserved.
     pub inline fn pushWrite(
         self: *Self,
         targetFd: posix.fd_t,
@@ -1124,6 +1387,9 @@ pub const BatchSQ = struct {
         sqe.flags = flags.flags();
     }
 
+    /// Reserves and fills a socket send in the batch, mirroring
+    /// `Ring.pushSend` (including the buffer lifetime requirement). Returns null
+    /// when the batch is full.
     pub inline fn pushSend(
         self: *Self,
         targetFd: posix.fd_t,
@@ -1163,6 +1429,43 @@ pub const BatchSQ = struct {
         sqe.rw_flags = msgFlags;
         sqe.ioprio = linux.IORING_RECVSEND_FIXED_BUF;
         sqe.buf_index = bufIndex;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Reserves an accept of one incoming connection, mirroring `Ring.pushAccept`.
+    pub inline fn pushAccept(
+        self: *Self,
+        listenFd: posix.fd_t,
+        taskIdx: u64,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.ACCEPT;
+        sqe.fd = listenFd;
+        sqe.rw_flags = posix.SOCK.CLOEXEC;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Reserves a linked timeout guarding the operation reserved right before
+    /// it, mirroring `Ring.pushTimeoutForOp`. It must be pushed in the same
+    /// batch as the operation it guards: the kernel only establishes the link
+    /// while assembling a single submission, otherwise it fails with `-EINVAL`.
+    pub inline fn pushTimeoutForOp(
+        self: *Self,
+        timespecPtr: *const linux.kernel_timespec,
+        taskIdx: u64,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.LINK_TIMEOUT;
+        sqe.fd = -1;
+        sqe.addr = @intFromPtr(timespecPtr);
+        sqe.len = 1;
+        sqe.rw_flags = linux.IORING_TIMEOUT_ETIME_SUCCESS;
         sqe.user_data = taskIdx;
         sqe.flags = flags.flags();
     }
@@ -1221,36 +1524,11 @@ pub const BatchCQ = struct {
 
         const ring = self.ring;
         const cqeIdx = self.head & ring.cqMask;
-        const cqe = &ring.cqEntries[cqeIdx];
-
-        const taskIdx = cqe.user_data;
-        const outRes = cqe.res;
-        const flags = cqe.flags;
-
-        // Bit 0 (1 << 0): the kernel selected a provided buffer from our pool
-        const hasBuffer = (flags & 1) != 0;
-
-        // Bit 1 (1 << 1): IORING_CQE_F_MORE. Multishot is active, the kernel will keep sending CQEs
-        const hasMore = (flags & 2) != 0;
-
-        // Bit 3 (1 << 3): IORING_CQE_F_NOTIF. This is the second CQE of a
-        // SEND_ZC request; it signals that the registered buffer may be reused.
-        const hasNotif = (flags & 8) != 0;
-
-        // Extract the Buffer ID from the upper 16 bits of the flags field (shift right by 16)
-        const bid = @as(u16, @intCast(flags >> 16));
 
         // Advance the batch cursor only; the ring head stays put until commit.
         self.head +%= 1;
 
-        return CQE{
-            .taskIdx = taskIdx,
-            .res = outRes,
-            .bid = bid,
-            .hasBuffer = hasBuffer,
-            .hasMore = hasMore,
-            .hasNotif = hasNotif,
-        };
+        return ring.cqEntries[cqeIdx];
     }
 
     /// Publishes every popped completion by atomically moving the ring's
@@ -1276,5 +1554,267 @@ pub const BatchCQ = struct {
         }
 
         return posix.unexpectedErrno(err);
+    }
+};
+
+pub const ReorderBuffer = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+
+    buf: []u8, // data: mod * itemSize
+    nexts: []i32, // nexts[i] = next node in the list
+    prevs: []i32, // prevs[i] = previous node in the list
+
+    size: u64, // window N
+    mod: u64, // 2N
+    itemSize: usize,
+
+    wave: u64, // expected seqIdx
+    first: i32, // head of the list
+    last: i32, // tail of the list
+
+    /// Creates a reorder buffer that holds up to `size` in-flight items of
+    /// `itemSize` bytes each.
+    ///
+    /// `size` is the reorder window: an item may arrive at most `size - 1`
+    /// positions ahead of the next expected sequence index, otherwise `push`
+    /// returns `error.FramesAreTooFarAway`. It must be a power of two and no
+    /// more than 0xFFFF, else `error.ReorderBufferSizeMustBeAPowOf2` or
+    /// `error.ReorderBufferNoMoreThan32KibItems` is returned. The backing
+    /// storage is `2 * size` slots, one ring length of headroom.
+    ///
+    /// The caller owns the returned value and must call `deinit` to release the
+    /// item buffer and the two link arrays.
+    pub fn init(allocator: std.mem.Allocator, size: usize, itemSize: usize) !Self {
+        if (@popCount(size) != 1) {
+            return error.ReorderBufferSizeMustBeAPowOf2;
+        }
+        if (size > 0xFFFF) {
+            return error.ReorderBufferNoMoreThan32KibItems;
+        }
+
+        const mod = 2 * size;
+        const buf = try allocator.alloc(u8, mod * itemSize);
+        errdefer allocator.free(buf);
+
+        const nexts = try allocator.alloc(i32, mod);
+        errdefer allocator.free(nexts);
+
+        const prevs = try allocator.alloc(i32, mod);
+        errdefer allocator.free(prevs);
+
+        @memset(nexts, -1);
+        @memset(prevs, -1);
+
+        return Self{
+            .allocator = allocator,
+            .buf = buf,
+            .nexts = nexts,
+            .prevs = prevs,
+            .size = size,
+            .mod = mod,
+            .itemSize = itemSize,
+            .wave = 0,
+            .first = -1,
+            .last = -1,
+        };
+    }
+
+    /// Releases the item buffer and the two link arrays allocated by `init`,
+    /// using the same allocator.
+    ///
+    /// After this the buffer is invalid and must not be used again. Every slice
+    /// previously returned by `popHeadCond`/`peekHeadCond` dangles.
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.buf);
+        self.allocator.free(self.nexts);
+        self.allocator.free(self.prevs);
+    }
+
+    /// Inserts the item in `data`, tagged with the absolute sequence index
+    /// `idx`, into the buffer while keeping pending items ordered by index.
+    ///
+    /// `data.len` must equal the `itemSize` given to `init`. An index below the
+    /// current wave is rejected with `error.OutdatedFrame`, and one `size` or
+    /// more ahead with `error.FramesAreTooFarAway`. The bytes are copied in, so
+    /// `data` remains owned by the caller.
+    ///
+    /// When `idx` equals the wave the wave advances across every consecutive
+    /// item already buffered, so those items become available to
+    /// `popHeadCond`/`peekHeadCond` without further pushes.
+    pub fn push(self: *Self, idx: u64, data: []const u8) !void {
+        const mod: i32 = @truncate(@as(i64, @bitCast(self.mod)));
+
+        // Ignore duplicates and outdated frames
+        if (idx < self.wave) {
+            @branchHint(.cold);
+            return error.OutdatedFrame;
+        }
+
+        // A gap larger than the window is a fatal error
+        const distFromWave = idx - self.wave;
+
+        if (distFromWave >= self.size) {
+            @branchHint(.cold);
+            return error.FramesAreTooFarAway;
+        }
+
+        const relIdx: i32 = @intCast(idx & (self.mod - 1));
+
+        // Write the data
+        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.itemSize;
+        @memcpy(self.buf[offset .. offset + self.itemSize], data);
+
+        // First element in the list
+        if (self.last < 0) {
+            @branchHint(.cold);
+            self.first = relIdx;
+            self.last = relIdx;
+            self.nexts[@intCast(relIdx)] = -1;
+            self.prevs[@intCast(relIdx)] = -1;
+
+            if (self.wave == idx) {
+                @branchHint(.likely);
+                self.wave += 1;
+            }
+
+            return;
+        }
+
+        // Fast path: insert after the tail
+        const distFromLast = (relIdx - self.last) & (mod - 1);
+        if (distFromLast < @as(i32, @intCast(self.size))) {
+            @branchHint(.likely);
+
+            self.nexts[@intCast(self.last)] = relIdx;
+            self.prevs[@intCast(relIdx)] = self.last;
+            self.nexts[@intCast(relIdx)] = -1;
+            self.last = relIdx;
+
+            if (self.wave == idx) {
+                @branchHint(.likely);
+                self.wave += 1;
+            }
+
+            return;
+        }
+
+        // Slow path: find the insertion point by moving backward from the tail
+        var cur: i32 = self.last;
+        while (cur >= 0) {
+            const distFromCur = (relIdx - cur) & (mod - 1);
+            // If the new element is "behind" cur (distance >= size), move backward
+            if (distFromCur >= @as(i32, @intCast(self.size))) {
+                @branchHint(.likely);
+
+                cur = self.prevs[@intCast(cur)];
+                continue;
+            }
+
+            break;
+        }
+
+        if (cur < 0) {
+            @branchHint(.cold);
+            // Insert at the head
+            self.nexts[@intCast(relIdx)] = self.first;
+            self.prevs[@intCast(relIdx)] = -1;
+            self.prevs[@intCast(self.first)] = relIdx;
+            self.first = relIdx;
+            self.advanceWave(idx);
+            return;
+        }
+
+        // Insert after cur
+        const nextNode = self.nexts[@intCast(cur)];
+        self.nexts[@intCast(cur)] = relIdx;
+        self.prevs[@intCast(relIdx)] = cur;
+        self.nexts[@intCast(relIdx)] = nextNode;
+        self.prevs[@intCast(nextNode)] = relIdx;
+        self.advanceWave(idx);
+    }
+
+    /// Advances the wave, skipping existing consecutive frames, when idx == s.wave.
+    inline fn advanceWave(self: *Self, idx: u64) void {
+        var frontIdx: i32 = @intCast(idx & (self.mod - 1));
+
+        if (self.wave != idx) {
+            return;
+        }
+
+        while (true) {
+            const nextIdx = self.nexts[@as(usize, @bitCast(@as(i64, frontIdx)))];
+            if (nextIdx -% frontIdx != 1) {
+                return;
+            }
+
+            self.wave += 1;
+            frontIdx = nextIdx;
+        }
+    }
+
+    /// Removes and returns the head item only if its sequence index equals
+    /// `idx`, otherwise returns null and leaves the buffer untouched.
+    ///
+    /// The returned slice is a borrowed view into the buffer: it stays valid
+    /// until a later `push` reuses its slot, and is not owned by the caller.
+    /// Use `peekHeadCond` plus `dropHead` instead when a failed operation should
+    /// be retried without consuming the frame.
+    pub fn popHeadCond(self: *Self, idx: u64) ?[]u8 {
+        const relIdx: i32 = @intCast(idx & (self.mod - 1));
+
+        if (self.first != relIdx) {
+            return null;
+        }
+
+        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.itemSize;
+        const res = self.buf[offset .. offset + self.itemSize];
+
+        const second = self.nexts[@bitCast(@as(i64, relIdx))];
+        if (second < 0) {
+            self.first = -1;
+            self.last = -1;
+            return res;
+        }
+
+        self.prevs[@bitCast(@as(i64, second))] = -1;
+        self.first = second;
+        return res;
+    }
+
+    /// Returns the head element only if its idx matches, WITHOUT removing it.
+    /// The element stays in the buffer until `dropHead` is called, so callers
+    /// can safely retry a failed operation without losing the frame.
+    pub fn peekHeadCond(self: *Self, idx: u64) ?[]u8 {
+        const relIdx: i32 = @intCast(idx & (self.mod - 1));
+
+        if (self.first != relIdx) {
+            return null;
+        }
+
+        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.itemSize;
+        return self.buf[offset .. offset + self.itemSize];
+    }
+
+    /// Removes the current head item without returning it, advancing the head
+    /// to the next buffered item.
+    ///
+    /// Meant to be paired with `peekHeadCond` once the peeked item has been
+    /// processed successfully; it is a no-op when the buffer is empty.
+    pub fn dropHead(self: *Self) void {
+        if (self.first < 0) {
+            return;
+        }
+
+        const second = self.nexts[@bitCast(@as(i64, self.first))];
+        if (second < 0) {
+            self.first = -1;
+            self.last = -1;
+            return;
+        }
+
+        self.prevs[@bitCast(@as(i64, second))] = -1;
+        self.first = second;
     }
 };

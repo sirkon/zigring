@@ -1,5 +1,17 @@
 const std = @import("std");
 
+/// Creates an index allocator for values of type `T`.
+///
+/// Indices are dense `u64` values: `add` returns one and `del` hands it back to
+/// the free pool for reuse. A root table of `capacity` slots is allocated up
+/// front, and up to `child_count` child tables of the same size are created
+/// lazily once the root is full, so the allocator can hand out
+/// `capacity * (1 + child_count)` values in total.
+///
+/// `capacity` must be a power of two and at least 4096 (see
+/// `error.CapacityMustBePowerOfTwo` and `error.CapacityTooSmall`). Values are
+/// stored by copy and no destructor is ever run, so `T` must be trivially
+/// copyable and must not own resources.
 pub fn Slots(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -15,18 +27,23 @@ pub fn Slots(comptime T: type) type {
         free: []i32,
         firstFree: i32,
 
-        // Быстрая побитовая магия вместо деления в рантайме:
-        capShift: u6, // Хранит log2(fallback_cap) для сдвига >>
-        capMask: u64, // Хранит (fallback_cap - 1) для маски &
+        // Fast bit magic instead of runtime division:
+        capShift: u6, // Stores log2(fallback_cap) for the >> shift
+        capMask: u64, // Stores (fallback_cap - 1) for the & mask
 
-        children: ?[]?*Self, // Массив из N дочерних слоттеров
+        children: ?[]?*Self, // Array of N child slotters
 
-        /// Инициализация оригинального слоттера
+        /// Allocates `capacity` slots and the free list, plus `child_count`
+        /// child pointers that stay null until `add` needs them.
+        ///
+        /// `capacity` must be a power of two of at least 4096, and
+        /// `child_count` may be zero for a table that never grows. The allocator
+        /// must outlive the slotter, since `deinit` frees through it.
         pub fn init(allocator: std.mem.Allocator, capacity: u64, child_count: usize) !Self {
-            // Проверки на степени двойки
+            // Checks for powers of two
             if (capacity == 0 or (capacity & (capacity - 1)) != 0) return error.CapacityMustBePowerOfTwo;
 
-            // Проверки твоих ограничений на размеры
+            // Checks for your size constraints
             if (capacity < 4096) return error.CapacityTooSmall;
 
             const slots = try allocator.alloc(Element, capacity);
@@ -35,7 +52,7 @@ pub fn Slots(comptime T: type) type {
             const free = try allocator.alloc(i32, capacity);
             errdefer allocator.free(free);
 
-            // Инициализируем список свободных элементов
+            // Initialize the free list
             for (0..capacity - 1) |i| {
                 free[i] = @intCast(i + 1);
             }
@@ -55,13 +72,18 @@ pub fn Slots(comptime T: type) type {
                 .slots = slots,
                 .free = free,
                 .firstFree = 0,
-                // Считаем параметры для битовой магии за 1 такт:
+                // Compute the parameters for the bit magic in 1 cycle:
                 .capShift = @intCast(@ctz(capacity)),
                 .capMask = capacity - 1,
                 .children = children,
             };
         }
 
+        /// Releases the root table, the free list and recursively destroys
+        /// every child slotter created by `add`.
+        ///
+        /// Uses the allocator captured at `init`. Afterwards the slotter is
+        /// invalid and must not be used again.
         pub fn deinit(self: *Self) void {
             if (self.children) |children_slice| {
                 for (children_slice) |maybe_child| {
@@ -76,8 +98,16 @@ pub fn Slots(comptime T: type) type {
             self.allocator.free(self.slots);
         }
 
+        /// Stores `v` by copying it into a free slot and returns that slot's
+        /// index.
+        ///
+        /// The index is stable until it is passed to `del`. When the root table
+        /// is full this transparently creates (or reuses) a child table, so it
+        /// keeps growing up to `capacity * (1 + child_count)`. Returns
+        /// `error.NoFreeSlots` once every table is full; allocation failures
+        /// from creating a child propagate out as well.
         pub fn add(self: *Self, v: T) !u64 {
-            // Быстрый путь: берем из оригинального слоттера
+            // Fast path: take from the original slotter
             if (self.firstFree >= 0) {
                 const free_idx = @as(usize, @intCast(self.firstFree));
                 self.firstFree = self.free[free_idx];
@@ -89,21 +119,21 @@ pub fn Slots(comptime T: type) type {
                 return @intCast(free_idx);
             }
 
-            // Места нет — идем по дочерним
+            // No room left, so walk the children
             if (self.children) |children_slice| {
                 for (children_slice, 0..) |maybe_child, i| {
                     if (maybe_child == null) {
                         const child_ptr = try self.allocator.create(Self);
                         errdefer self.allocator.destroy(child_ptr);
 
-                        // У дочерних слоттеров размер равен fallback_cap, и дочерних у них больше нет (0)
+                        // Child slotters have size equal to fallback_cap and no children of their own (0)
                         child_ptr.* = try Self.init(self.allocator, self.slots.len, 0);
                         children_slice[i] = child_ptr;
                     }
 
                     const child = children_slice[i].?;
                     if (child.add(v)) |childLocalIdx| {
-                        // Масштабируем глобальный индекс
+                        // Scale to a global index
                         return self.cap + (i * self.slots.len) + childLocalIdx;
                     } else |err| {
                         if (err == error.NoFreeSlots) continue;
@@ -115,6 +145,12 @@ pub fn Slots(comptime T: type) type {
             return error.NoFreeSlots;
         }
 
+        /// Returns a copy of the value stored at `idx`, or null if the index is
+        /// out of range or not currently allocated (never added or already
+        /// deleted).
+        ///
+        /// Runs in constant time: a shift and mask pick the table, with no
+        /// division or modulo.
         pub fn get(self: Self, idx: u64) ?T {
             if (idx < self.cap) {
                 const slot = self.slots[idx];
@@ -125,9 +161,9 @@ pub fn Slots(comptime T: type) type {
             if (self.children) |childrenSlice| {
                 const offset = idx - self.cap;
 
-                // Вот она, магия без тяжелого деления:
-                const childI = offset >> self.capShift; // Сдвиг вместо '/'
-                const childrenLocalIdx = offset & self.capMask; // Маска вместо '%'
+                // Here it is, the magic without heavy division:
+                const childI = offset >> self.capShift; // Shift instead of '/'
+                const childrenLocalIdx = offset & self.capMask; // Mask instead of '%'
 
                 if (childI < childrenSlice.len) {
                     if (childrenSlice[childI]) |child| {
@@ -138,6 +174,11 @@ pub fn Slots(comptime T: type) type {
             return null;
         }
 
+        /// Frees the slot at `idx` so a later `add` can reuse it.
+        ///
+        /// Out-of-range or already-free indices are silently ignored. No
+        /// destructor runs, since `T` is treated as plain data. The recycled
+        /// index may be handed out again by the very next `add`.
         pub fn del(self: *Self, idx: u64) void {
             if (idx < self.cap) {
                 self.slots[idx] = .{ .value = undefined, .exists = false };
@@ -149,7 +190,7 @@ pub fn Slots(comptime T: type) type {
             if (self.children) |childrenSlice| {
                 const offset = idx - self.cap;
 
-                // И тут тоже летает за 1 такт:
+                // And here it also flies in 1 cycle:
                 const childI = offset >> self.capShift;
                 const childLocalIdx = offset & self.capMask;
 
@@ -163,6 +204,16 @@ pub fn Slots(comptime T: type) type {
     };
 }
 
+/// An index allocator whose slots are fixed-size byte buffers.
+///
+/// Like `Slots(T)` it hands out dense `u64` indices, but each index maps to an
+/// `elementSize`-byte slice of one large backing allocation. A root table of
+/// `capacity` buffers is allocated up front, and up to `childCount` child
+/// tables are grown lazily, giving `capacity * (1 + childCount)` slots in
+/// total.
+///
+/// `capacity` must be a power of two and at least 4096, and `elementSize` must
+/// be non-zero. Buffers are never zeroed when a slot is reused.
 pub const BufferSlots = struct {
     const Self = @This();
 
@@ -180,7 +231,13 @@ pub const BufferSlots = struct {
 
     children: ?[]?*Self,
 
-    /// Инициализация буферного слоттера
+    /// Allocates `capacity * elementSize` bytes of backing storage plus the
+    /// bookkeeping arrays, and `childCount` lazily-filled child pointers.
+    ///
+    /// `capacity` must be a power of two of at least 4096, and `elementSize`
+    /// must be non-zero (see the corresponding errors). The backing allocation
+    /// is owned by the returned value and freed by `deinit`; the allocator must
+    /// outlive the slotter.
     pub fn init(
         allocator: std.mem.Allocator,
         capacity: u64,
@@ -227,6 +284,11 @@ pub const BufferSlots = struct {
         };
     }
 
+    /// Releases the backing storage, the bookkeeping arrays and every child
+    /// table created by `addSlot`/`alloc`.
+    ///
+    /// Uses the allocator captured at `init`. Every slice previously returned
+    /// by `addSlot` or `get` becomes dangling.
     pub fn deinit(self: *Self) void {
         if (self.children) |childrenSlice| {
             for (childrenSlice) |maybeChild| {
@@ -242,10 +304,18 @@ pub const BufferSlots = struct {
         self.allocator.free(self.buf);
     }
 
-    // Тип результата возвращаем в PascalCase, как просит Zig-стайл
+    /// Result of `addSlot`: the global index of the reserved slot and a
+    /// borrowed, uninitialized slice of `elementSize` bytes to write into.
     pub const AddResult = struct { idx: u64, slice: []u8 };
 
-    /// Добавление элемента через аллокацию индекса без копирования (Zero-Copy).
+    /// Reserves a free slot and returns its index together with a borrowed
+    /// slice into the backing memory, without copying anything into it.
+    ///
+    /// The caller writes directly into the returned slice (zero-copy). That
+    /// slice aliases the slotter's backing allocation: it must not be freed and
+    /// stays valid only until `del(idx)` or `deinit`. Grows into a new child
+    /// table when the root is full, and returns `error.NoFreeSlots` when every
+    /// table is full.
     pub fn addSlot(self: *Self) !AddResult {
         if (self.firstFree >= 0) {
             const freeIdx = @as(usize, @intCast(self.firstFree));
@@ -288,13 +358,22 @@ pub const BufferSlots = struct {
         return error.NoFreeSlots;
     }
 
-    /// Добавление элемента путем копирования готового слайса байт
+    /// Convenience wrapper around `addSlot` that reserves a slot and returns
+    /// only its index, when the in-place slice is not needed right away.
+    ///
+    /// The slot's bytes are left untouched; fetch them later with `get`.
+    /// Returns `error.NoFreeSlots` when full.
     pub fn alloc(self: *Self) !u64 {
         const res = try self.addSlot();
         return res.idx;
     }
 
-    /// Получение слайса байт по глобальному индексу
+    /// Returns the borrowed `elementSize`-byte slice stored at `idx`, or null
+    /// if the index is out of range or not currently allocated.
+    ///
+    /// The slice aliases the slotter's backing memory: mutate it freely, but do
+    /// not free it, and treat it as invalid once the slot is deleted or the
+    /// slotter deinitialized.
     pub fn get(self: Self, idx: u64) ?[]u8 {
         if (idx < self.cap) {
             if (!self.exists[idx]) return null;
@@ -317,7 +396,13 @@ pub const BufferSlots = struct {
         return null;
     }
 
-    /// Удаление элемента
+    /// Frees the slot at `idx`, making its bytes available for a later
+    /// `addSlot` or `alloc`.
+    ///
+    /// Out-of-range or already-free indices are silently ignored. The previous
+    /// contents are not cleared, so a reused slot still holds the old data
+    /// until overwritten. Any slice previously obtained for this slot is
+    /// invalidated and must not be used afterwards.
     pub fn del(self: *Self, idx: u64) void {
         if (idx < self.cap) {
             if (!self.exists[idx]) return;

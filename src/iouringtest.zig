@@ -5,6 +5,7 @@ const Ring = @import("iouring.zig").Ring;
 const BufferSizeClass = @import("iouring.zig").BufferSizeClass;
 const CQE = @import("iouring.zig").CQE;
 const TaskFlags = @import("iouring.zig").TaskFlags;
+const ReorderBuffer = @import("iouring.zig").ReorderBuffer;
 const time = @import("time.zig");
 
 const noOfRequests = 100_000;
@@ -54,7 +55,7 @@ const echoServerFSM = struct {
     placeholder: []u8,
     bufRest: []u8,
     critical: []u8,
-    ordbuf: *reorderBuffer,
+    ordbuf: *ReorderBuffer,
 
     reqCount: u64,
     respCount: u64,
@@ -77,7 +78,7 @@ const echoServerFSM = struct {
         ring: *Ring,
         slots: *slotter.BufferSlots,
         clientFd: posix.fd_t,
-        ordbuf: *reorderBuffer,
+        ordbuf: *ReorderBuffer,
         limit: u64,
     ) !Self {
         return Self{
@@ -194,16 +195,16 @@ const echoServerFSM = struct {
                     return error.CQEError;
                 }
 
-                if (cqe.taskIdx != recvIdx) {
+                if (cqe.taskIdx() != recvIdx) {
                     // This is a notification about reply.
                     self.respCount += 1;
                     self.state = .needRecv;
-                    self.slots.del(cqe.taskIdx);
+                    self.slots.del(cqe.taskIdx());
                     return true;
                 }
 
                 // This is a client request.
-                const buffer = self.ring.buffer(.tiny, cqe.bid) orelse {
+                const buffer = self.ring.buffer(.tiny, cqe.bid()) orelse {
                     try self.setCritical("size class .tiny is not initialized (CQE = {})", .{cqe});
                     return error.CQEBidError;
                 };
@@ -214,7 +215,7 @@ const echoServerFSM = struct {
 
                 @memcpy(self.placeholder[self.bufRest.len .. self.bufRest.len + cqe.result()], buffer[0..cqe.result()]);
                 self.bufRest = self.placeholder[0 .. self.bufRest.len + cqe.result()];
-                self.ring.releaseBuffer(.tiny, cqe.bid);
+                self.ring.releaseBuffer(.tiny, cqe.bid());
 
                 self.recvArmed = false;
                 self.state = .needRecv;
@@ -403,28 +404,28 @@ const echoClientFSM = struct {
                     return error.CQEError;
                 }
 
-                if (cqe.taskIdx == sendIdx) {
-                    // Это ПОЛУЧЕННЫЕ ДАННЫЕ от сервера (CQE от pushRecvZC)
-                    const buffer = self.ring.buffer(.tiny, cqe.bid) orelse {
+                if (cqe.taskIdx() == sendIdx) {
+                    // These are RECEIVED DATA from the server (CQE from pushRecvZC)
+                    const buffer = self.ring.buffer(.tiny, cqe.bid()) orelse {
                         try self.setCritical("size class .tiny is not initialized (CQE = {})", .{cqe});
                         return error.CQEBidError;
                     };
 
-                    // Копируем данные из provided buffer в placeholder
+                    // Copy the data from the provided buffer into the placeholder
                     if (self.bufRest.len > 0) {
                         std.mem.copyForwards(u8, self.placeholder[0..self.bufRest.len], self.bufRest);
                     }
                     @memcpy(self.placeholder[self.bufRest.len .. self.bufRest.len + cqe.result()], buffer[0..cqe.result()]);
                     self.bufRest = self.placeholder[0 .. self.bufRest.len + cqe.result()];
 
-                    self.ring.releaseBuffer(.tiny, cqe.bid);
+                    self.ring.releaseBuffer(.tiny, cqe.bid());
 
                     self.recvArmed = false;
                     self.state = .needCheck;
                     return true;
                 }
 
-                self.slots.del(cqe.taskIdx);
+                self.slots.del(cqe.taskIdx());
 
                 if (self.reqCount < self.limit) {
                     self.state = .needSend;
@@ -522,7 +523,7 @@ fn getAcceptedConn(ring: *Ring, sock: posix.fd_t) !posix.fd_t {
         try ring.pushAccept(sock, 2, TaskFlags.expectNext());
         while (true) {
             const cqe = waitNoMatterWhat(ring);
-            if (cqe.taskIdx != 2) {
+            if (cqe.taskIdx() != 2) {
                 return error.UnexpectedIOUringTask;
             }
 
@@ -544,238 +545,12 @@ fn getAcceptedConn(ring: *Ring, sock: posix.fd_t) !posix.fd_t {
     }
 }
 
-const reorderBuffer = struct {
-    const Self = @This();
-
-    allocator: std.mem.Allocator,
-
-    buf: []u8, // данные: mod * itemSize
-    nexts: []i32, // nexts[i] = следующий узел в списке
-    prevs: []i32, // prevs[i] = предыдущий узел в списке
-
-    size: u64, // окно N
-    mod: u64, // 2N
-    itemSize: usize,
-
-    wave: u64, // ожидаемый seqIdx
-    first: i32, // голова списка
-    last: i32, // хвост списка
-
-    pub fn init(allocator: std.mem.Allocator, size: usize, itemSize: usize) !Self {
-        if (@popCount(size) != 1) {
-            return error.ReorderBufferSizeMustBeAPowOf2;
-        }
-        if (size > 0xFFFF) {
-            return error.ReorderBufferNoMoreThan32KibItems;
-        }
-
-        const mod = 2 * size;
-        const buf = try allocator.alloc(u8, mod * itemSize);
-        errdefer allocator.free(buf);
-
-        const nexts = try allocator.alloc(i32, mod);
-        errdefer allocator.free(nexts);
-
-        const prevs = try allocator.alloc(i32, mod);
-        errdefer allocator.free(prevs);
-
-        @memset(nexts, -1);
-        @memset(prevs, -1);
-
-        return Self{
-            .allocator = allocator,
-            .buf = buf,
-            .nexts = nexts,
-            .prevs = prevs,
-            .size = size,
-            .mod = mod,
-            .itemSize = itemSize,
-            .wave = 0,
-            .first = -1,
-            .last = -1,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.allocator.free(self.buf);
-        self.allocator.free(self.nexts);
-        self.allocator.free(self.prevs);
-    }
-
-    /// Вставляет элемент с абсолютным seqIdx.
-    /// Возвращает true, если волна сдвинулась (есть готовые к обработке данные).
-    pub fn push(self: *Self, idx: u64, data: []const u8) !void {
-        const mod: i32 = @truncate(@as(i64, @bitCast(self.mod)));
-
-        // Дубликаты и устаревшие — игнорируем
-        if (idx < self.wave) {
-            @branchHint(.cold);
-            return error.OutdatedFrame;
-        }
-
-        // Разрыв больше окна — фатальная ошибка
-        const distFromWave = idx - self.wave;
-
-        if (distFromWave >= self.size) {
-            @branchHint(.cold);
-            return error.FramesAreTooFarAway;
-        }
-
-        const relIdx: i32 = @intCast(idx & (self.mod - 1));
-
-        // Записываем данные
-        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.itemSize;
-        @memcpy(self.buf[offset .. offset + self.itemSize], data);
-
-        // Первый элемент в списке
-        if (self.last < 0) {
-            @branchHint(.cold);
-            self.first = relIdx;
-            self.last = relIdx;
-            self.nexts[@intCast(relIdx)] = -1;
-            self.prevs[@intCast(relIdx)] = -1;
-
-            if (self.wave == idx) {
-                @branchHint(.likely);
-                self.wave += 1;
-            }
-
-            return;
-        }
-
-        // Быстрый путь: вставка после хвоста
-        const distFromLast = (relIdx - self.last) & (mod - 1);
-        if (distFromLast < @as(i32, @intCast(self.size))) {
-            @branchHint(.likely);
-
-            self.nexts[@intCast(self.last)] = relIdx;
-            self.prevs[@intCast(relIdx)] = self.last;
-            self.nexts[@intCast(relIdx)] = -1;
-            self.last = relIdx;
-
-            if (self.wave == idx) {
-                @branchHint(.likely);
-                self.wave += 1;
-            }
-
-            return;
-        }
-
-        // Медленный путь: ищем место вставки, двигаясь от хвоста назад
-        var cur: i32 = self.last;
-        while (cur >= 0) {
-            const distFromCur = (relIdx - cur) & (mod - 1);
-            // Если новый элемент "позади" cur (расстояние >= size) — двигаемся назад
-            if (distFromCur >= @as(i32, @intCast(self.size))) {
-                @branchHint(.likely);
-
-                cur = self.prevs[@intCast(cur)];
-                continue;
-            }
-
-            break;
-        }
-
-        if (cur < 0) {
-            @branchHint(.cold);
-            // Вставляем в голову
-            self.nexts[@intCast(relIdx)] = self.first;
-            self.prevs[@intCast(relIdx)] = -1;
-            self.prevs[@intCast(self.first)] = relIdx;
-            self.first = relIdx;
-            self.advanceWave(idx);
-            return;
-        }
-
-        // Вставляем после cur
-        const nextNode = self.nexts[@intCast(cur)];
-        self.nexts[@intCast(cur)] = relIdx;
-        self.prevs[@intCast(relIdx)] = cur;
-        self.nexts[@intCast(relIdx)] = nextNode;
-        self.prevs[@intCast(nextNode)] = relIdx;
-        self.advanceWave(idx);
-    }
-
-    /// Сдвигает волну, пропуская существующие последовательные, если idx == s.wave.
-    inline fn advanceWave(self: *Self, idx: u64) void {
-        var frontIdx: i32 = @intCast(idx & (self.mod - 1));
-
-        if (self.wave != idx) {
-            return;
-        }
-
-        while (true) {
-            const nextIdx = self.nexts[@as(usize, @bitCast(@as(i64, frontIdx)))];
-            if (nextIdx -% frontIdx != 1) {
-                return;
-            }
-
-            self.wave += 1;
-            frontIdx = nextIdx;
-        }
-    }
-
-    /// Вынимает первый элемент из списка при условии, что у него нужный idx.
-    pub fn popHeadCond(self: *Self, idx: u64) ?[]u8 {
-        const relIdx: i32 = @intCast(idx & (self.mod - 1));
-
-        if (self.first != relIdx) {
-            return null;
-        }
-
-        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.itemSize;
-        const res = self.buf[offset .. offset + self.itemSize];
-
-        const second = self.nexts[@bitCast(@as(i64, relIdx))];
-        if (second < 0) {
-            self.first = -1;
-            self.last = -1;
-            return res;
-        }
-
-        self.prevs[@bitCast(@as(i64, second))] = -1;
-        self.first = second;
-        return res;
-    }
-
-    /// Returns the head element only if its idx matches, WITHOUT removing it.
-    /// The element stays in the buffer until `dropHead` is called, so callers
-    /// can safely retry a failed operation without losing the frame.
-    pub fn peekHeadCond(self: *Self, idx: u64) ?[]u8 {
-        const relIdx: i32 = @intCast(idx & (self.mod - 1));
-
-        if (self.first != relIdx) {
-            return null;
-        }
-
-        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.itemSize;
-        return self.buf[offset .. offset + self.itemSize];
-    }
-
-    /// Removes the current head element from the list.
-    pub fn dropHead(self: *Self) void {
-        if (self.first < 0) {
-            return;
-        }
-
-        const second = self.nexts[@bitCast(@as(i64, self.first))];
-        if (second < 0) {
-            self.first = -1;
-            self.last = -1;
-            return;
-        }
-
-        self.prevs[@bitCast(@as(i64, second))] = -1;
-        self.first = second;
-    }
-};
-
 test "reorder buffer" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
     {
-        // Пишем-удаляем-пишем-удаляем.
-        var ordbuf = try reorderBuffer.init(arena.allocator(), 128, 1);
+        // Write-delete-write-delete.
+        var ordbuf = try ReorderBuffer.init(arena.allocator(), 128, 1);
         defer ordbuf.deinit();
         for (0..1000) |i| {
             const buf = [1]u8{@truncate(i)};
@@ -790,8 +565,8 @@ test "reorder buffer" {
     }
 
     {
-        // Пишем 1-2, добавляем 0, пишем 4-5, добавляем 3. И так скока-то.
-        var ordbuf = try reorderBuffer.init(arena.allocator(), 128, 1);
+        // Write 1-2, add 0, write 4-5, add 3. And so on for a while.
+        var ordbuf = try ReorderBuffer.init(arena.allocator(), 128, 1);
         defer ordbuf.deinit();
         for (0..15) |i| {
             const tasks = [3]u64{
@@ -828,8 +603,8 @@ test "reorder buffer" {
     }
 }
 
-/// Принимает любое ошибочное выражение (Inferred Error Union).
-/// Если там ошибка — паникует с выводом имени ошибки. Иначе возвращает чистое значение.
+/// Accepts any fallible expression (Inferred Error Union).
+/// If there is an error, panics with the error name. Otherwise returns the clean value.
 inline fn must(what: []const u8, result: anytype) @TypeOf(if (@typeInfo(@TypeOf(result)) == .error_union) (result catch unreachable) else result) {
     if (@typeInfo(@TypeOf(result)) == .error_union) {
         return result catch |err| {
@@ -854,13 +629,17 @@ test "echo server and client" {
     // Similarly, client must check the responses against its time again.
     // Both should check the payload's sequence_idx grows as 0, 1, 2, ..., 99999.
 
-    const Manager = @import("ring_manager.zig").WeightedRingManager;
+    const Manager = @import("ring_factory.zig").Factory;
     const slotter = @import("slotter.zig");
     const pthread = @import("pthread.zig");
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
+    // Two independent SQPOLL threads: one for the server ring, one for the
+    // client ring. Sharing a single poller serializes both ends of the
+    // connection on one CPU-bound kernel thread and roughly doubles the
+    // round-trip time.
+    var mgr = try Manager.init(arena.allocator(), 2);
     var barrier = pthread.Mutex.init();
 
     const SharedState = struct {
@@ -883,11 +662,11 @@ test "echo server and client" {
             must("create proved buffer", ring.regiterSizeClassReceiveBuffer(.tiny, 16384));
             var serverArena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             var slots: slotter.BufferSlots = must("create buffer slots", slotter.BufferSlots.init(serverArena.allocator(), 16384, 32, 4));
-            var ordbuf = must("create reorder buffer", reorderBuffer.init(serverArena.allocator(), 128, 21));
+            var ordbuf = must("create reorder buffer", ReorderBuffer.init(serverArena.allocator(), 128, 21));
 
             // Create socket, bind it and start listening.
             const sockets = @import("sockets.zig");
-            const sockFd = must("create socket server", sockets.createServerSocket());
+            const sockFd = must("create socket server", sockets.createTCPServerSocket());
             defer _ = linux.close(sockFd);
 
             must("bind server socket to the address", ring.pushBindIp4(sockFd, 1, "0.0.0.0", 60006, .{}));
@@ -899,13 +678,6 @@ test "echo server and client" {
 
             // Push accepts until there's a client.
             const clientFd = must("wait and accept the client", getAcceptedConn(&ring, sockFd));
-
-            var one: c_int = 1;
-            const rc = linux.setsockopt(clientFd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
-            const errno = linux.errno(rc);
-            if (errno != .SUCCESS) {
-                std.debug.panic("forbid socket to split send frames: {}", .{errno});
-            }
 
             var fsm = must("create server fsm", echoServerFSM.init(serverArena.allocator(), &ring, &slots, clientFd, &ordbuf, noOfRequests));
             defer fsm.deinit();
@@ -928,7 +700,7 @@ test "echo server and client" {
             //     std.debug.panic("failed to bind server thread to P-core 4: {any}\n", .{err});
             // };
 
-            // Получаем кольцо и инициализируем HugePage буферы
+            // Acquire the ring and initialize the HugePage buffers
             var ring: Ring = must("create client ring", state.mgr.acquireRing(4096, 1));
             defer ring.deinit();
             must("initialize client buffer class", ring.regiterSizeClassReceiveBuffer(.tiny, 16384));
@@ -936,12 +708,12 @@ test "echo server and client" {
             var clientArena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer clientArena.deinit();
 
-            // Слоттер для отслеживания отправляемых тасок
+            // Slotter for tracking the tasks being sent
             var slots: slotter.BufferSlots = must("create client buffer slots", slotter.BufferSlots.init(clientArena.allocator(), 16384, 128, 4));
 
-            // Коннектимся к серверу (через сокет-хелперы)
+            // Connect to the server (via the socket helpers)
             const sockets = @import("sockets.zig");
-            const clientFd = must("create client socket", sockets.createClientSocket());
+            const clientFd = must("create client socket", sockets.createTCPClientSocket(null));
             defer _ = linux.close(clientFd);
 
             state.barrier.lock();
@@ -982,7 +754,7 @@ test "echo server and client" {
 }
 
 test "create and write file" {
-    const Manager = @import("ring_manager.zig").WeightedRingManager;
+    const Manager = @import("ring_factory.zig").Factory;
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -992,7 +764,7 @@ test "create and write file" {
     var ring = try mgr.acquireRing(128, 1);
     try ring.pushOpenDir(1, 0, "/tmp", .{});
 
-    try ring.initializeSizeClassBuffer(.page, 1024);
+    try ring.regiterSizeClassReceiveBuffer(.page, 1024);
 
     var cqe = try wait(&ring);
     const dirFd = cqe.res;
@@ -1015,7 +787,7 @@ test "create and write file" {
 
     try ring.pushReadZC(fileFd, 1, .page, .{});
     cqe = try wait(&ring);
-    const buffer = ring.buffer(.page, cqe.bid) orelse {
+    const buffer = ring.buffer(.page, cqe.bid()) orelse {
         std.debug.panic("missing buffer for the cqe {}", .{cqe});
     };
 
@@ -1025,7 +797,7 @@ test "create and write file" {
 }
 
 test "create a server and wait for 1 second for incoming connections what will never happen" {
-    const Manager = @import("ring_manager.zig").WeightedRingManager;
+    const Manager = @import("ring_factory.zig").Factory;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var mgr = try Manager.init(arena.allocator(), 1);
@@ -1034,7 +806,7 @@ test "create a server and wait for 1 second for incoming connections what will n
     var ring = try mgr.acquireRing(128, 1);
 
     const sockets = @import("sockets.zig");
-    const sockFd = try sockets.createServerSocket();
+    const sockFd = try sockets.createTCPServerSocket();
     defer _ = linux.close(sockFd);
 
     try ring.pushBindIp4(sockFd, 1, "0.0.0.0", 60006, .{});
@@ -1049,8 +821,20 @@ test "create a server and wait for 1 second for incoming connections what will n
     };
 
     while (true) {
-        try ring.pushAccept(sockFd, 2, TaskFlags.expectNext());
-        try ring.pushTimeoutForOp(&timerSpec, 3, .{});
+        // The accept and the timeout guarding it must travel in the same
+        // submission batch: the kernel only establishes the link while
+        // assembling a single batch, otherwise LINK_TIMEOUT is rejected with
+        // -EINVAL. Waking the poller after the accept alone would split them.
+        var batch = ring.batchedSQ() orelse {
+            std.debug.panic("no room in the SQ for accept + timeout", .{});
+        };
+        if (batch.pushAccept(sockFd, 2, TaskFlags.expectNext()) == null) {
+            std.debug.panic("failed to reserve the accept SQE", .{});
+        }
+        if (batch.pushTimeoutForOp(&timerSpec, 3, .{}) == null) {
+            std.debug.panic("failed to reserve the link timeout SQE", .{});
+        }
+        try batch.commit();
 
         var needReroll = false;
         for (0..2) |_| {
@@ -1059,7 +843,7 @@ test "create a server and wait for 1 second for incoming connections what will n
             cqe = waitPeacefully(&ring);
             std.debug.print("got {} for {any}\n", .{ linux.errno(cqe.result()), cqe });
 
-            if (cqe.taskIdx != 2) {
+            if (cqe.taskIdx() != 2) {
                 continue;
             }
 
@@ -1075,8 +859,7 @@ test "create a server and wait for 1 second for incoming connections what will n
                     needReroll = true;
                 },
                 else => {
-                    std.debug.print("unexpected error {any} in {} \n", .{ cqe.errno(), cqe });
-                    try std.testing.expect(false);
+                    std.debug.panic("unexpected error {any} in {} \n", .{ cqe.errno(), cqe });
                 },
             }
         }
