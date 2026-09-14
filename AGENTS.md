@@ -119,7 +119,9 @@ unchanged until the matching completion is consumed.
 | Signature                                                                | Operation              | Notes                                      |
 |--------------------------------------------------------------------------|------------------------|--------------------------------------------|
 | `pushWrite(targetFd, taskIdx, dataPtr, len, flags)`                      | `WRITE`                | Short writes possible; check `res`.        |
+| `pushWritev(targetFd, taskIdx, iovecs, flags)`                           | `WRITEV`               | Gathers `iovecs`; short writes possible.   |
 | `pushRead(targetFd, taskIdx, dst, flags)`                                | `READ`                 | Short reads possible; check `res`.         |
+| `pushReadv(targetFd, taskIdx, iovecs, flags)`                            | `READV`                | Scatters into `iovecs`; short reads possible. |
 | `pushSend(targetFd, taskIdx, dataPtr, len, flags)`                       | `SEND`                 | Copied send.                               |
 | `pushRecv(targetFd, taskIdx, buf, flags)`                                | `RECV`                 | Caller buffer.                             |
 | `pushSendZC(targetFd, taskIdx, dataPtr, len, bufIndex, msgFlags, flags)` | `SEND_ZC`              | Two CQEs; needs `registerBuffers`.         |
@@ -491,7 +493,8 @@ helper does close on that path.
 ## Gotcha checklist
 
 - **Pointer lifetime**: every buffer/path/`timespec`/sockaddr passed to a
-  `push*` must stay valid and unchanged until its `CQE` is consumed.
+  `push*` must stay valid and unchanged until its `CQE` is consumed. For the
+  vectored ops that includes both the iovec array and every segment it points to.
 - **Return provided buffers exactly once** with `releaseBuffer`, or the pool
   drains and multishot recv starts returning `-ENOBUFS`.
 - **`SEND_ZC` yields two CQEs** (`hasMore`, then `hasNotif`); the registered

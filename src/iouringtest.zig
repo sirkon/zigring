@@ -796,6 +796,67 @@ test "create and write file" {
     cqe = try wait(&ring);
 }
 
+test "writev and readv file" {
+    const Manager = @import("ring_factory.zig").Factory;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var mgr = try Manager.init(arena.allocator(), 1);
+    defer mgr.deinit();
+
+    var ring = try mgr.acquireRing(128, 1);
+
+    try ring.pushOpenDir(1, 0, "/tmp", .{});
+    var cqe = try wait(&ring);
+    const dirFd = cqe.res;
+
+    try ring.pushOpenFile(1, dirFd, "filev.txt", linux.O{ .CREAT = true, .ACCMODE = .WRONLY }, .{});
+    cqe = try wait(&ring);
+    const writeFd = cqe.res;
+
+    const seg1 = "Hello, ";
+    const seg2 = "vectored ";
+    const seg3 = "world!\n";
+    const total = seg1.len + seg2.len + seg3.len;
+
+    var writeIovecs = [_]posix.iovec_const{
+        .{ .base = seg1.ptr, .len = seg1.len },
+        .{ .base = seg2.ptr, .len = seg2.len },
+        .{ .base = seg3.ptr, .len = seg3.len },
+    };
+
+    try ring.pushWritev(writeFd, 1, &writeIovecs, .{});
+    cqe = try wait(&ring);
+    try std.testing.expectEqual(total, cqe.result());
+
+    try ring.pushClose(1, writeFd, .{});
+    cqe = try wait(&ring);
+
+    try ring.pushOpenFile(1, dirFd, "filev.txt", linux.O{ .ACCMODE = .RDONLY }, .{});
+    cqe = try wait(&ring);
+    const readFd = cqe.res;
+
+    var dst1: [seg1.len]u8 = undefined;
+    var dst2: [seg2.len]u8 = undefined;
+    var dst3: [seg3.len]u8 = undefined;
+
+    var readIovecs = [_]posix.iovec{
+        .{ .base = &dst1, .len = dst1.len },
+        .{ .base = &dst2, .len = dst2.len },
+        .{ .base = &dst3, .len = dst3.len },
+    };
+
+    try ring.pushReadv(readFd, 1, &readIovecs, .{});
+    cqe = try wait(&ring);
+    try std.testing.expectEqual(total, cqe.result());
+    try std.testing.expectEqualStrings(seg1, &dst1);
+    try std.testing.expectEqualStrings(seg2, &dst2);
+    try std.testing.expectEqualStrings(seg3, &dst3);
+
+    try ring.pushClose(1, readFd, .{});
+    cqe = try wait(&ring);
+}
+
 test "create a server and wait for 1 second for incoming connections what will never happen" {
     const Manager = @import("ring_factory.zig").Factory;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

@@ -480,6 +480,36 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
+    /// Submits a vectored write (`IORING_OP.WRITEV`) that gathers the
+    /// `iovecs.len` segments it points to and writes their concatenation to
+    /// `targetFd`, at the file's current offset.
+    ///
+    /// The kernel reads the iovec array and every segment it references
+    /// asynchronously, so all of them must stay valid and unchanged until the
+    /// matching completion arrives. A short write is possible, so check
+    /// `CQE.result()`. `taskIdx` is opaque user data echoed back in the
+    /// resulting `CQE` to identify the operation.
+    pub inline fn pushWritev(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        iovecs: []const posix.iovec_const,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.WRITEV;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(iovecs.ptr);
+        // Vectored reads/writes take the segment count in `len`.
+        sqe.len = @intCast(iovecs.len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
     /// Submits a socket send (`IORING_OP.SEND`) of `len` bytes from `dataPtr` to
     /// `targetFd`.
     ///
@@ -608,6 +638,35 @@ pub const Ring = struct {
         sqe.len = @intCast(dst.len);
         sqe.flags = flags.flags();
         sqe.user_data = taskIdx;
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Submits a vectored read (`IORING_OP.READV`) that scatters up to the
+    /// total length of `iovecs` into the `iovecs.len` segments it points to,
+    /// from `targetFd` at the file's current offset.
+    ///
+    /// The kernel reads the iovec array and writes into every segment
+    /// asynchronously, so all of them must stay valid and unchanged until the
+    /// matching completion arrives. A short read is possible, so check
+    /// `CQE.result()`. `taskIdx` is echoed back in the resulting `CQE`.
+    pub inline fn pushReadv(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        iovecs: []const posix.iovec,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.READV;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(iovecs.ptr);
+        // Vectored reads/writes take the segment count in `len`.
+        sqe.len = @intCast(iovecs.len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
