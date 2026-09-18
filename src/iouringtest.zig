@@ -609,7 +609,7 @@ inline fn must(what: []const u8, result: anytype) @TypeOf(if (@typeInfo(@TypeOf(
     if (@typeInfo(@TypeOf(result)) == .error_union) {
         return result catch |err| {
             @branchHint(.cold);
-            std.debug.panic("{s}: MUST violation - unexpected error.{any}", .{ what, err });
+            std.debug.panic("{s}: MUST violation - unexpected {any}", .{ what, err });
         };
     }
     return result;
@@ -1077,4 +1077,57 @@ test "streamedSQ survives many commit rounds" {
         cqe = try wait(&ring);
         try std.testing.expect(cqe.res > 0);
     }
+}
+
+test "one thread wakes another that is waiting on CQ" {
+    const pthread = @import("pthread.zig");
+    const Manager = @import("ring_factory.zig").Factory;
+
+    var mgr = try Manager.init(std.testing.allocator, 1);
+    defer mgr.deinit();
+    var r1 = try mgr.acquireRing(128, 1);
+    var r2 = try mgr.acquireRing(128, 1);
+
+    const taskIdx: u64 = 1;
+    const msgIdx: u32 = 2;
+
+    const SharedState = struct {
+        ring: *Ring,
+        lock: pthread.Mutex,
+    };
+    var sharedState = SharedState{
+        .ring = &r2,
+        .lock = pthread.Mutex.init(),
+    };
+    sharedState.lock.lock();
+    const threadRunner = struct {
+        fn run(state: *SharedState) void {
+            state.lock.unlock();
+            const start = time.nowNs();
+            state.ring.park();
+            const elapsed = time.nowNs() - start;
+
+            // Heuristic check: we have been slept for at least 100us.
+            if (elapsed / 1000 < 100) {
+                std.debug.panic("we were expecting some serious sleep over 100us, got {}us", .{elapsed / 1000});
+            }
+
+            const cqe = state.ring.popCQE() orelse {
+                std.debug.panic("CQE was expected", .{});
+            };
+
+            _ = must("check task idx", std.testing.expectEqual(cqe.user_data, taskIdx));
+            _ = must("check message idx", std.testing.expectEqual(cqe.res, msgIdx));
+        }
+    }.run;
+
+    const thread = try pthread.Thread.spawn(&sharedState, threadRunner);
+    sharedState.lock.lock();
+    sharedState.lock.unlock();
+
+    // Heuristic: wait for the park to be actually reached.
+    try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .real);
+    try r1.pushMsgRing(&r2, taskIdx, msgIdx, .{});
+
+    thread.join();
 }

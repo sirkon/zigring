@@ -139,7 +139,8 @@ unchanged until the matching completion is consumed.
 | `pushConnectIp4(fd, user_data, ip_str, port, flags)`                     | `CONNECT`              | `ip_str` parsed for you.                   |
 | `pushBindIp6(fd, user_data, ip_str, port, flags)`                        | `BIND`                 | e.g. `"::1"`, `"::"`.                      |
 | `pushConnectIp6(fd, user_data, ip_str, port, flags)`                     | `CONNECT`              | e.g. `"::1"`.                              |
-| `pushMsgRing(targetRingFd, taskIdx, msgResult, flags)`                   | `MSG_RING`             | Wakes another ring; no local CQE.          |
+| `pushMsgRing(targetRing, taskIdx, msgResult, flags)`                     | `MSG_RING`             | Wakes another ring; no local CQE.          |
+| `pushMsgRingFd(targetRingFd, taskIdx, msgResult, flags)`                 | `MSG_RING`             | Same, but takes the target ring fd.        |
 | `pushTimeout(taskIdx, timespecPtr, flags)`                               | `TIMEOUT`              | Standalone timer.                          |
 | `pushTimeoutForOp(timespecPtr, taskIdx, flags)`                          | `LINK_TIMEOUT`         | Must share a batch with its op.            |
 
@@ -155,9 +156,9 @@ Gotchas:
 - **`pushTimeoutForOp`** guards the operation submitted immediately before it.
   Push both in the *same* `batchedSQ` batch, otherwise the kernel rejects the
   SQE with `-EINVAL`. See "Linked timeout" below.
-- **`pushMsgRing`** never produces a local completion (`SkipSuccess`); the
-  target ring sees a CQE whose `res` is `msgResult` and whose `taskIdx` is this
-  call's `taskIdx`.
+- **`pushMsgRing`/`pushMsgRingFd`** never produce a local completion
+  (`SkipSuccess`); the target ring sees a CQE whose `res` is `msgResult` and
+  whose `taskIdx` is this call's `taskIdx`.
 - Some operations are offloaded to io-wq internally (`pushOpenDir`,
   `pushOpenFile`, `pushClose`, `pushRename` use `IOSQE_ASYNC`), which keeps
   SQPOLL from sleeping on blocking work.

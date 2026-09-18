@@ -1249,7 +1249,7 @@ pub const Ring = struct {
     /// `taskIdx` is this call's `taskIdx`, so the receiver can tell senders
     /// apart. The operation is non-blocking and no completion is generated on
     /// the sending ring (`SkipSuccess`), so nothing needs to be awaited here.
-    pub inline fn pushMsgRing(
+    pub inline fn pushMsgRingFd(
         self: *Self,
         targetRingFd: posix.fd_t, // fd of the ring belonging to the sleeping thread
         taskIdx: u64,
@@ -1273,6 +1273,24 @@ pub const Ring = struct {
         // The task will execute on the current CPU instantly without blocking.
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Sends a wakeup to another io_uring (`IORING_OP.MSG_RING`) identified by
+    /// `targetRing`, useful for waking a thread parked on that ring.
+    ///
+    /// This is a convenience wrapper over `pushMsgRingFd` that uses the target
+    /// ring's own descriptor. The target ring receives a `CQE` whose `res` is
+    /// `msgResult` and whose `taskIdx` is this call's `taskIdx`. The operation
+    /// is non-blocking and no completion is generated on the sending ring
+    /// (`SkipSuccess`), so nothing needs to be awaited here.
+    pub inline fn pushMsgRing(
+        self: *Self,
+        targetRing: *Ring, // ring belonging to the sleeping thread
+        taskIdx: u64,
+        msgResult: u32, // Custom message type/signal (will go into cqe.res)
+        flags: TaskFlags,
+    ) !void {
+        return self.pushMsgRingFd(targetRing.fd, taskIdx, msgResult, flags);
     }
 
     /// Arms a standalone timer (`IORING_OP.TIMEOUT`) that produces a `CQE`
