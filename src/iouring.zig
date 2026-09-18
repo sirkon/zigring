@@ -452,6 +452,24 @@ pub const Ring = struct {
         return .{ .ring = self, .head = head, .tail = tail };
     }
 
+    /// Opens a streaming submission window over the SQ, the long-lived
+    /// counterpart of `batchedSQ`.
+    ///
+    /// It starts from the same head/tail snapshot, but every `commit` rebuilds
+    /// the window from the ring's live cursors, so the same handle keeps
+    /// accepting operations across many submission rounds instead of being a
+    /// one-shot batch. Returns null when the ring is already full at open time.
+    pub inline fn streamedSQ(self: *Self) ?StreamSQ {
+        const tail = self.sqTail.*;
+        const head = @atomicLoad(u32, self.sqHead, .acquire);
+
+        if (tail -% head >= self.sqMask + 1) {
+            return null;
+        }
+
+        return .{ .ring = self, .head = head, .tail = tail };
+    }
+
     /// Submits a plain file write (`IORING_OP.WRITE`) of `len` bytes from
     /// `dataPtr` to `targetFd`, at the file's current offset.
     ///
@@ -472,6 +490,41 @@ pub const Ring = struct {
 
         sqe.opcode = linux.IORING_OP.WRITE;
         sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Submits a plain file write (`IORING_OP.WRITE`) of `len` bytes from
+    /// `dataPtr` to `targetFd`, starting at `fileOffset`.
+    ///
+    /// Unlike `pushWrite`, which writes at the file's current offset and lets
+    /// the kernel advance it, this variant passes an explicit offset in
+    /// `sqe.off`, so the file position is left untouched. It is safe to queue
+    /// several writes to distinct offsets on the same fd. The kernel reads
+    /// `dataPtr` asynchronously, so that buffer must stay valid and unchanged
+    /// until the matching completion arrives. A short write is possible, so
+    /// check `CQE.result()`.
+    pub inline fn pushWriteOffset(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        fileOffset: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.WRITE;
+        sqe.fd = targetFd;
+        // An explicit offset in `off` leaves the file position untouched,
+        // unlike an offset of -1 which makes the kernel use it.
+        sqe.off = fileOffset;
         sqe.addr = @intFromPtr(dataPtr);
         sqe.len = @intCast(len);
         sqe.user_data = taskIdx;
@@ -638,6 +691,39 @@ pub const Ring = struct {
         sqe.len = @intCast(dst.len);
         sqe.flags = flags.flags();
         sqe.user_data = taskIdx;
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Submits a read (`IORING_OP.READ`) of up to `dst.len` bytes from
+    /// `targetFd` into the caller-owned `dst`, starting at `fileOffset`.
+    ///
+    /// Unlike `pushRead`, which reads at the file's current offset and lets
+    /// the kernel advance it, this variant passes an explicit offset in
+    /// `sqe.off`, so the file position is left untouched. It is safe to queue
+    /// several reads from distinct offsets on the same fd. `dst` must stay
+    /// valid until the matching completion and a short read is possible, so
+    /// check `CQE.result()`.
+    pub inline fn pushReadOffset(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        fileOffset: u64,
+        dst: []u8,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.READ;
+        sqe.fd = targetFd;
+        // An explicit offset in `off` leaves the file position untouched,
+        // unlike an offset of -1 which makes the kernel use it.
+        sqe.off = fileOffset;
+        sqe.addr = @intFromPtr(dst.ptr);
+        sqe.len = @intCast(dst.len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
@@ -1302,7 +1388,12 @@ pub const Ring = struct {
     /// without publishing the consumed head, so many completions can be drained
     /// and flushed with a single `io_uring_enter` on `commit`. Returns null when
     /// there is nothing to consume, i.e. as soon as the head reaches the tail.
-    pub inline fn batchedCQ(self: *Self) ?BatchCQ {
+    ///
+    /// `maxEntries` caps how many completions the window exposes: the instance
+    /// returns null after that many pops, even if the ring holds more, so a
+    /// single batch can be kept bounded. Pass `null` to drain everything
+    /// currently visible.
+    pub inline fn batchedCQ(self: *Self, maxEntries: ?u32) ?BatchCQ {
         const head = self.cqHead.*;
         const tail = @atomicLoad(u32, self.cqTail, .acquire);
 
@@ -1310,7 +1401,14 @@ pub const Ring = struct {
             return null;
         }
 
-        return .{ .ring = self, .head = head, .tail = tail };
+        const available = tail -% head;
+        const limit = if (maxEntries) |max| @min(available, max) else available;
+
+        if (limit == 0) {
+            return null;
+        }
+
+        return .{ .ring = self, .head = head, .tail = head +% limit };
     }
 
     /// Blocks the calling thread until at least one completion is available.
@@ -1446,6 +1544,51 @@ pub const BatchSQ = struct {
         sqe.flags = flags.flags();
     }
 
+    /// Reserves and fills a plain file write at an explicit offset in the
+    /// batch, mirroring `Ring.pushWriteOffset` (including the buffer lifetime
+    /// requirement). Returns null when the batch is full.
+    pub inline fn pushWriteOffset(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        fileOffset: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.WRITE;
+        sqe.fd = targetFd;
+        sqe.off = fileOffset;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Reserves and fills a read at an explicit offset in the batch, mirroring
+    /// `Ring.pushReadOffset` (including the buffer lifetime requirement).
+    /// Returns null when the batch is full.
+    pub inline fn pushReadOffset(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        fileOffset: u64,
+        dst: []u8,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.READ;
+        sqe.fd = targetFd;
+        sqe.off = fileOffset;
+        sqe.addr = @intFromPtr(dst.ptr);
+        sqe.len = @intCast(dst.len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
     /// Reserves and fills a socket send in the batch, mirroring
     /// `Ring.pushSend` (including the buffer lifetime requirement). Returns null
     /// when the batch is full.
@@ -1551,6 +1694,223 @@ pub const BatchSQ = struct {
         }
 
         return posix.unexpectedErrno(err);
+    }
+};
+
+/// A streaming view over the submission queue, created by `Ring.streamedSQ`.
+///
+/// It mirrors `BatchSQ` (same `push*` surface and single-wakeup `commit`) but
+/// is meant to be kept alive: every `commit` re-reads the ring's live SQ head
+/// and tail, so the window slides forward as the kernel consumes the entries
+/// and the same handle can drive one submission round after another. Each push
+/// still returns null once the window is exhausted, i.e. as soon as it would
+/// overwrite an SQE the kernel has not consumed yet.
+pub const StreamSQ = struct {
+    const Self = @This();
+
+    /// The ring this stream belongs to.
+    ring: *Ring,
+    /// SQ head captured at open time and re-read by every `commit`.
+    head: u32,
+    /// SQ producer cursor, advanced by every pushed operation and re-synced
+    /// with the ring tail by every `commit`.
+    tail: u32,
+
+    /// Reserves the next SQE, zeroes it and records it in the SQ array.
+    /// Returns null once the window reaches the captured head plus one full
+    /// ring length.
+    inline fn reserve(self: *Self) ?*linux.io_uring_sqe {
+        const ring = self.ring;
+
+        if (self.tail -% self.head >= ring.sqMask + 1) {
+            return null;
+        }
+
+        const idx = self.tail & ring.sqMask;
+        const sqe = &ring.sqEntries[idx];
+
+        @memset(std.mem.asBytes(sqe), 0);
+        ring.sqArray[idx] = idx;
+
+        self.tail +%= 1;
+
+        return sqe;
+    }
+
+    /// Reserves and fills a plain file write in the stream, mirroring
+    /// `Ring.pushWrite` (including the buffer lifetime requirement). Returns
+    /// null when the window is full, in which case nothing was reserved.
+    pub inline fn pushWrite(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.WRITE;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Reserves and fills a plain file write at an explicit offset in the
+    /// stream, mirroring `Ring.pushWriteOffset` (including the buffer lifetime
+    /// requirement). Returns null when the window is full.
+    pub inline fn pushWriteOffset(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        fileOffset: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.WRITE;
+        sqe.fd = targetFd;
+        sqe.off = fileOffset;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Reserves and fills a read at an explicit offset in the stream, mirroring
+    /// `Ring.pushReadOffset` (including the buffer lifetime requirement).
+    /// Returns null when the window is full.
+    pub inline fn pushReadOffset(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        fileOffset: u64,
+        dst: []u8,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.READ;
+        sqe.fd = targetFd;
+        sqe.off = fileOffset;
+        sqe.addr = @intFromPtr(dst.ptr);
+        sqe.len = @intCast(dst.len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Reserves and fills a socket send in the stream, mirroring
+    /// `Ring.pushSend` (including the buffer lifetime requirement). Returns null
+    /// when the window is full.
+    pub inline fn pushSend(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.SEND;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Zero-copy send, mirroring `Ring.pushSendZC`. See that method for the
+    /// buffer lifetime and dual-completion semantics.
+    pub inline fn pushSendZC(
+        self: *Self,
+        targetFd: posix.fd_t,
+        taskIdx: u64,
+        dataPtr: [*]const u8,
+        len: usize,
+        bufIndex: u16,
+        msgFlags: u32,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.SEND_ZC;
+        sqe.fd = targetFd;
+        sqe.addr = @intFromPtr(dataPtr);
+        sqe.len = @intCast(len);
+        sqe.rw_flags = msgFlags;
+        sqe.ioprio = linux.IORING_RECVSEND_FIXED_BUF;
+        sqe.buf_index = bufIndex;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Reserves an accept of one incoming connection, mirroring `Ring.pushAccept`.
+    pub inline fn pushAccept(
+        self: *Self,
+        listenFd: posix.fd_t,
+        taskIdx: u64,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.ACCEPT;
+        sqe.fd = listenFd;
+        sqe.rw_flags = posix.SOCK.CLOEXEC;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Reserves a linked timeout guarding the operation reserved right before
+    /// it, mirroring `Ring.pushTimeoutForOp`. It must be pushed in the same
+    /// window as the operation it guards: the kernel only establishes the link
+    /// while assembling a single submission, otherwise it fails with `-EINVAL`.
+    pub inline fn pushTimeoutForOp(
+        self: *Self,
+        timespecPtr: *const linux.kernel_timespec,
+        taskIdx: u64,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.LINK_TIMEOUT;
+        sqe.fd = -1;
+        sqe.addr = @intFromPtr(timespecPtr);
+        sqe.len = 1;
+        sqe.rw_flags = linux.IORING_TIMEOUT_ETIME_SUCCESS;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Publishes every SQE pushed so far by atomically moving the ring's tail,
+    /// nudges the kernel poller so it observes the new entries, and then
+    /// re-reads the ring's live head and tail so the window slides forward for
+    /// the next round. The handle stays valid and reusable across commits.
+    pub fn commit(self: *Self) !void {
+        const ring = self.ring;
+
+        @atomicStore(u32, ring.sqTail, self.tail, .release);
+
+        var sig: linux.sigset_t = undefined;
+        const res = linux.io_uring_enter(
+            ring.fd,
+            1,
+            0,
+            linux.IORING_ENTER_SQ_WAKEUP,
+            &sig,
+        );
+
+        const err = linux.errno(res);
+        if (err != .SUCCESS) {
+            return posix.unexpectedErrno(err);
+        }
+
+        self.head = @atomicLoad(u32, ring.sqHead, .acquire);
+        self.tail = ring.sqTail.*;
     }
 };
 

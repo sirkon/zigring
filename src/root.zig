@@ -50,10 +50,16 @@ pub const CQE = ring.CQE;
 /// `commit`, collapsing many submissions into one kernel wakeup.
 pub const BatchSQ = ring.BatchSQ;
 
+/// A streaming view over the submission queue, opened with `Ring.streamedSQ`.
+///
+/// It offers the same push surface as `BatchSQ`, but its `commit` re-reads the
+/// ring's cursors so the handle can drive one submission round after another.
+pub const StreamSQ = ring.StreamSQ;
+
 /// A batched view over the completion queue, opened with `Ring.batchedCQ`.
 ///
 /// Several completions can be drained through it and acknowledged with a
-/// single `commit`.
+/// single `commit`. The window can be capped with the `maxEntries` argument.
 pub const BatchCQ = ring.BatchCQ;
 
 /// A sliding-window buffer that restores order to out-of-order completions.

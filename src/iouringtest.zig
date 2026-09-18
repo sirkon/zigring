@@ -796,6 +796,57 @@ test "create and write file" {
     cqe = try wait(&ring);
 }
 
+test "write and read file at an explicit offset" {
+    const Manager = @import("ring_factory.zig").Factory;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var mgr = try Manager.init(arena.allocator(), 1);
+    defer mgr.deinit();
+
+    var ring = try mgr.acquireRing(128, 1);
+    try ring.pushOpenDir(1, 0, "/tmp", .{});
+    var cqe = try wait(&ring);
+    const dirFd = cqe.res;
+
+    try ring.pushOpenFile(1, dirFd, "offsetfile.txt", linux.O{ .CREAT = true, .TRUNC = true, .ACCMODE = .WRONLY }, .{});
+    cqe = try wait(&ring);
+    const fileFd = cqe.res;
+
+    // Write past the start of the file; the kernel must land the bytes at the
+    // requested offset (leaving a hole) and leave the file position untouched.
+    const helloWorld = "Hello World!\n";
+    const hole = 8;
+    try ring.pushWriteOffset(fileFd, 1, hole, helloWorld, helloWorld.len, .{});
+    cqe = try wait(&ring);
+    try std.testing.expectEqual(helloWorld.len, cqe.result());
+
+    try ring.pushClose(1, fileFd, .{});
+    cqe = try wait(&ring);
+
+    try ring.pushOpenFile(1, dirFd, "offsetfile.txt", linux.O{ .ACCMODE = .RDONLY }, .{});
+    cqe = try wait(&ring);
+    const readFd = cqe.res;
+
+    var dst: [hole + helloWorld.len]u8 = @splat(0);
+    try ring.pushReadOffset(readFd, 1, 0, &dst, .{});
+    cqe = try wait(&ring);
+    try std.testing.expectEqual(dst.len, cqe.result());
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0 }, dst[0..hole]);
+    try std.testing.expectEqualStrings(helloWorld, dst[hole..]);
+
+    // A read starting inside the payload must see only the bytes from there on.
+    var tail: [4]u8 = undefined;
+    try ring.pushReadOffset(readFd, 2, hole + 8, &tail, .{});
+    cqe = try wait(&ring);
+    try std.testing.expectEqual(tail.len, cqe.result());
+    try std.testing.expectEqualStrings("rld!", &tail);
+
+    try ring.pushClose(1, readFd, .{});
+    cqe = try wait(&ring);
+}
+
 test "writev and readv file" {
     const Manager = @import("ring_factory.zig").Factory;
 
@@ -928,5 +979,105 @@ test "create a server and wait for 1 second for incoming connections what will n
         if (!needReroll) {
             break;
         }
+    }
+}
+
+test "batchedCQ caps the drained entries" {
+    const Manager = @import("ring_factory.zig").Factory;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var mgr = try Manager.init(arena.allocator(), 1);
+    defer mgr.deinit();
+
+    var ring = try mgr.acquireRing(128, 1);
+
+    try ring.pushOpenDir(1, 0, "/tmp", .{});
+    const dirCqe = try wait(&ring);
+    const dirFd = dirCqe.res;
+    defer _ = linux.close(dirFd);
+
+    // Push the whole burst without draining, so the CQ holds all of them.
+    var i: u32 = 0;
+    while (i < 4) : (i += 1) {
+        try ring.pushOpenFile(100 + i, dirFd, "batchcq.txt", linux.O{ .CREAT = true, .ACCMODE = .WRONLY }, .{});
+    }
+
+    // Each park returns once at least one more completion is available, so
+    // four of them guarantee the whole burst is visible to the batch.
+    var spins: usize = 0;
+    while (true) : (spins += 1) {
+        const head = ring.cqHead.*;
+        const tail = @atomicLoad(u32, ring.cqTail, .acquire);
+        if (tail -% head >= 4) break;
+
+        if (spins % 1000 == 999) {
+            ring.park();
+        } else {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    var fds: [4]posix.fd_t = undefined;
+    var seen: u32 = 0;
+
+    var capped = ring.batchedCQ(1) orelse return error.MissingBatch;
+    while (capped.popCQE()) |cqe| {
+        fds[seen] = @intCast(cqe.res);
+        seen += 1;
+    }
+    try capped.commit();
+    try std.testing.expectEqual(@as(u32, 1), seen);
+
+    // The remaining three completions must still be visible afterwards.
+    var rest = ring.batchedCQ(null) orelse return error.MissingBatch;
+    while (rest.popCQE()) |cqe| {
+        fds[seen] = @intCast(cqe.res);
+        seen += 1;
+    }
+    try rest.commit();
+    try std.testing.expectEqual(@as(u32, 4), seen);
+
+    for (fds) |fd| {
+        _ = linux.close(fd);
+    }
+}
+
+test "streamedSQ survives many commit rounds" {
+    const Manager = @import("ring_factory.zig").Factory;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var mgr = try Manager.init(arena.allocator(), 1);
+    defer mgr.deinit();
+
+    var ring = try mgr.acquireRing(8, 1);
+
+    try ring.pushOpenDir(1, 0, "/tmp", .{});
+    var cqe = try wait(&ring);
+    const dirFd = cqe.res;
+
+    try ring.pushOpenFile(1, dirFd, "streamsq.txt", linux.O{ .CREAT = true, .ACCMODE = .WRONLY }, .{});
+    cqe = try wait(&ring);
+    const fileFd = cqe.res;
+    defer _ = linux.close(fileFd);
+
+    var stream = ring.streamedSQ() orelse return error.MissingStream;
+
+    // More rounds than the ring has entries: if the window did not slide after
+    // each commit the stream would wedge once the SQ filled up.
+    var round: u32 = 0;
+    while (round < 16) : (round += 1) {
+        while (stream.pushWrite(fileFd, round, "x", 1, .{}) == null) {
+            try stream.commit();
+        }
+        try stream.commit();
+    }
+
+    // Drain every completion the stream produced.
+    var drained: u32 = 0;
+    while (drained < 16) : (drained += 1) {
+        cqe = try wait(&ring);
+        try std.testing.expect(cqe.res > 0);
     }
 }
