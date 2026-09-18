@@ -1,6 +1,6 @@
 .{
     .name = .zigring,
-    .version = "0.0.3",
+    .version = "0.0.6",
     .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",
