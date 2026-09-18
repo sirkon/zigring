@@ -722,13 +722,11 @@ test "echo server and client" {
             const serverIp = "127.0.0.1";
             const serverPort = 60006;
 
-            std.debug.print("connect to the server {s}:{}\n", .{ serverIp, serverPort });
             must("connect to the server", ring.pushConnectIp4(clientFd, 1, serverIp, serverPort, .{}));
             const cqe = must("wait for the connection approval", wait(&ring));
             if (cqe.res < 0) {
                 std.debug.panic("failed to connect to the server: {}", .{linux.errno(cqe.result())});
             }
-            std.debug.print("connected\n", .{});
             var fsm = must("create client fsm", echoClientFSM.init(clientArena.allocator(), &ring, &slots, clientFd, noOfRequests));
 
             const start = time.nowNs();
@@ -741,7 +739,9 @@ test "echo server and client" {
                 }
             }
             const elapsed = time.nowNs() - start;
-            std.debug.print("it took {} seconds to finish the job\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000_000});
+            // // Uncomment for manual testing.
+            // std.debug.print("it took {} seconds to finish the job\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000_000});
+            _ = elapsed;
         }
     }.run;
 
@@ -950,10 +950,7 @@ test "create a server and wait for 1 second for incoming connections what will n
 
         var needReroll = false;
         for (0..2) |_| {
-            std.debug.print("waiting\n", .{});
-
             cqe = waitPeacefully(&ring);
-            std.debug.print("got {} for {any}\n", .{ linux.errno(cqe.result()), cqe });
 
             if (cqe.taskIdx() != 2) {
                 continue;

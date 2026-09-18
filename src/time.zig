@@ -43,7 +43,6 @@ test "times" {
     try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(1), .awake);
 
     const elapsed = nowNs() - start;
-    std.debug.print("Real elapsed ns: {}\n", .{elapsed});
 
     // Check that we slept about 1 ms with a ±200_000 nanosecond tolerance (for OS jitter)
     const expected_ns: i64 = 1_000_000;
