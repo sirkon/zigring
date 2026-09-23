@@ -1401,6 +1401,18 @@ pub const Ring = struct {
         return self.cqEntries[cqeIdx];
     }
 
+    /// Returns true when at least one completion is waiting in the CQ, false
+    /// otherwise. Unlike `popCQE` it does not consume anything, so it is a cheap
+    /// way to poll for readiness without advancing the CQ head. It observes the
+    /// same acquire load of the CQ tail as `popCQE`, so a true result guarantees
+    /// a following `popCQE`/`batchedCQ` sees at least one completion.
+    pub inline fn checkCQNotEmpty(self: *Self) bool {
+        const head = self.cqHead.*;
+        const tail = @atomicLoad(u32, self.cqTail, .acquire);
+
+        return head != tail;
+    }
+
     /// Opens a batched consumption window over the CQ. It snapshots the current
     /// CQ head and tail and hands back a `BatchedCQ` that reads completions
     /// without publishing the consumed head, so many completions can be drained
