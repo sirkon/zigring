@@ -7,6 +7,12 @@ const BufferPool = @import("provided_buffer.zig").ProvidedBufferPool;
 pub const pageSize: usize = 4096;
 pub const fireAndForgetTaskIdx: u64 = std.math.maxInt(u64);
 
+/// `IORING_TIMEOUT_MULTISHOT` (1 << 6): turns `IORING_OP.TIMEOUT` into a
+/// periodic ticker that re-arms itself and keeps posting completions. Not
+/// declared by `std.os.linux`, so it is spelled out here; available since
+/// Linux 6.4.
+const IORING_TIMEOUT_MULTISHOT: u32 = 1 << 6;
+
 pub const BufferSizeClass = enum(u16) {
     tiny, // 128 B
     small, // 512 B
@@ -1334,6 +1340,63 @@ pub const Ring = struct {
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
 
+    /// Arms a periodic ticker (`IORING_OP.TIMEOUT` with
+    /// `IORING_TIMEOUT_MULTISHOT`) that posts one `CQE` every `quantizationPtr`
+    /// for up to `ticks` ticks.
+    ///
+    /// `quantizationPtr` is the tick interval, i.e. how much time elapses
+    /// between consecutive completions; it is always relative (the kernel
+    /// rejects absolute values combined with multishot). `ticks` limits how
+    /// many completions the ticker emits: a value of `0` means unlimited (the
+    /// ticker keeps running until it is canceled), otherwise it fires exactly
+    /// `ticks` times and then stops.
+    ///
+    /// Each tick completes with `res == -ETIME`; `CQE.hasMore()` is set while
+    /// more ticks are pending and is cleared on the final completion, which is
+    /// the signal that the ticker is done. The timeout is flagged
+    /// `IORING_TIMEOUT_ETIME_SUCCESS`, so an expiring ticker is not treated as
+    /// a failed request and does not sever any link.
+    ///
+    /// `quantizationPtr` is read by the kernel while the ticker runs, so it
+    /// must remain valid and unchanged until the ticker's last completion is
+    /// consumed. Use `pushCancel` to stop an unlimited ticker early. Take care
+    /// with `SkipSuccess`: suppressing completions also hides the only signal
+    /// that the pointer is no longer needed.
+    pub inline fn pushTicker(
+        self: *Self,
+        taskIdx: u64,
+        quantizationPtr: *const linux.kernel_timespec,
+        ticks: u32,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.TIMEOUT;
+        sqe.fd = -1; // No file descriptor needed for timers, write -1
+
+        // Pass the pointer to the tick quantization (interval) structure.
+        sqe.addr = @intFromPtr(quantizationPtr);
+
+        // For multishot timeouts the kernel requires the event count in len to
+        // be exactly 1, otherwise it rejects the SQE with -EINVAL.
+        sqe.len = 1;
+
+        // The tick limit travels in `off`: 0 means unlimited, a positive value
+        // is the exact number of ticks the ticker emits before stopping.
+        sqe.off = ticks;
+
+        // Multishot requests only make sense with relative values, so never set
+        // IORING_TIMEOUT_ABS here. ETIME_SUCCESS keeps an expiring tick from
+        // being reported as a failed request.
+        sqe.rw_flags = IORING_TIMEOUT_MULTISHOT | linux.IORING_TIMEOUT_ETIME_SUCCESS;
+        sqe.flags = flags.flags();
+
+        sqe.user_data = taskIdx;
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
     /// Attaches a timeout (`IORING_OP.LINK_TIMEOUT`) that cancels the operation
     /// immediately preceding it if that operation does not finish in time.
     ///
@@ -1374,6 +1437,42 @@ pub const Ring = struct {
 
         // Use the global constant for the timer instead of a custom taskIdx
         sqe.user_data = taskIdx;
+
+        return self.commitOp(targetSlot.idx, targetSlot.head);
+    }
+
+    /// Cancels an in-flight operation whose `user_data` equals
+    /// `targetTaskIdx` (`IORING_OP.ASYNC_CANCEL` matching on `user_data`).
+    ///
+    /// This is the way to stop long-running operations that keep producing
+    /// completions on their own, such as any multishot (`pushRecvMultishotZC`,
+    /// `pushAcceptMultishot`): one cancel tears the whole multishot down and
+    /// its next (final) completion clears `hasMore`. `taskIdx` is the cancel
+    /// request's own id, echoed in its completion.
+    ///
+    /// The cancel completes with `res == 0` when a matching request was found
+    /// and canceled, `-ENOENT` when nothing matched (already completed, never
+    /// submitted, or already canceled) and `-EALREADY` when the target is
+    /// already completing. The canceled operation still delivers its own
+    /// completion, normally `-ECANCELED`, so a caller must expect one
+    /// completion per canceled op on top of the cancel's own.
+    pub inline fn pushCancel(
+        self: *Self,
+        taskIdx: u64,
+        targetTaskIdx: u64,
+        flags: TaskFlags,
+    ) !void {
+        const targetSlot = try self.getOpSlot();
+        const sqe = targetSlot.entry;
+
+        sqe.opcode = linux.IORING_OP.ASYNC_CANCEL;
+        // No fd is involved: matching happens on the target's user_data, which
+        // the kernel reads from `addr` when no cancel flag selects another key.
+        sqe.fd = -1;
+        sqe.addr = targetTaskIdx;
+        sqe.rw_flags = 0;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
 
         return self.commitOp(targetSlot.idx, targetSlot.head);
     }
@@ -1681,6 +1780,28 @@ pub const BatchSQ = struct {
         sqe.flags = flags.flags();
     }
 
+    /// Reserves a periodic ticker in the batch, mirroring `Ring.pushTicker`
+    /// (including the quantization pointer lifetime requirement). `ticks == 0`
+    /// means unlimited. Returns null when the batch is full.
+    pub inline fn pushTicker(
+        self: *Self,
+        taskIdx: u64,
+        quantizationPtr: *const linux.kernel_timespec,
+        ticks: u32,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.TIMEOUT;
+        sqe.fd = -1;
+        sqe.addr = @intFromPtr(quantizationPtr);
+        sqe.len = 1;
+        sqe.off = ticks;
+        sqe.rw_flags = IORING_TIMEOUT_MULTISHOT | linux.IORING_TIMEOUT_ETIME_SUCCESS;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
     /// Reserves a linked timeout guarding the operation reserved right before
     /// it, mirroring `Ring.pushTimeoutForOp`. It must be pushed in the same
     /// batch as the operation it guards: the kernel only establishes the link
@@ -1698,6 +1819,25 @@ pub const BatchSQ = struct {
         sqe.addr = @intFromPtr(timespecPtr);
         sqe.len = 1;
         sqe.rw_flags = linux.IORING_TIMEOUT_ETIME_SUCCESS;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Reserves a cancellation of the in-flight operation identified by
+    /// `targetTaskIdx`, mirroring `Ring.pushCancel`. Returns null when the
+    /// batch is full, in which case nothing was reserved.
+    pub inline fn pushCancel(
+        self: *Self,
+        taskIdx: u64,
+        targetTaskIdx: u64,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.ASYNC_CANCEL;
+        sqe.fd = -1;
+        sqe.addr = targetTaskIdx;
+        sqe.rw_flags = 0;
         sqe.user_data = taskIdx;
         sqe.flags = flags.flags();
     }
@@ -1895,6 +2035,28 @@ pub const StreamSQ = struct {
         sqe.flags = flags.flags();
     }
 
+    /// Reserves a periodic ticker in the window, mirroring `Ring.pushTicker`
+    /// (including the quantization pointer lifetime requirement). `ticks == 0`
+    /// means unlimited. Returns null when the window is exhausted.
+    pub inline fn pushTicker(
+        self: *Self,
+        taskIdx: u64,
+        quantizationPtr: *const linux.kernel_timespec,
+        ticks: u32,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.TIMEOUT;
+        sqe.fd = -1;
+        sqe.addr = @intFromPtr(quantizationPtr);
+        sqe.len = 1;
+        sqe.off = ticks;
+        sqe.rw_flags = IORING_TIMEOUT_MULTISHOT | linux.IORING_TIMEOUT_ETIME_SUCCESS;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
     /// Reserves a linked timeout guarding the operation reserved right before
     /// it, mirroring `Ring.pushTimeoutForOp`. It must be pushed in the same
     /// window as the operation it guards: the kernel only establishes the link
@@ -1912,6 +2074,25 @@ pub const StreamSQ = struct {
         sqe.addr = @intFromPtr(timespecPtr);
         sqe.len = 1;
         sqe.rw_flags = linux.IORING_TIMEOUT_ETIME_SUCCESS;
+        sqe.user_data = taskIdx;
+        sqe.flags = flags.flags();
+    }
+
+    /// Reserves a cancellation of the in-flight operation identified by
+    /// `targetTaskIdx`, mirroring `Ring.pushCancel`. Returns null when the
+    /// window is exhausted, in which case nothing was reserved.
+    pub inline fn pushCancel(
+        self: *Self,
+        taskIdx: u64,
+        targetTaskIdx: u64,
+        flags: TaskFlags,
+    ) ?void {
+        const sqe = self.reserve() orelse return null;
+
+        sqe.opcode = linux.IORING_OP.ASYNC_CANCEL;
+        sqe.fd = -1;
+        sqe.addr = targetTaskIdx;
+        sqe.rw_flags = 0;
         sqe.user_data = taskIdx;
         sqe.flags = flags.flags();
     }

@@ -1131,3 +1131,173 @@ test "one thread wakes another that is waiting on CQ" {
 
     thread.join();
 }
+
+test "cancel an armed multishot accept" {
+    const Manager = @import("ring_factory.zig").Factory;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var mgr = try Manager.init(arena.allocator(), 1);
+    defer mgr.deinit();
+
+    var ring = try mgr.acquireRing(128, 1);
+
+    const sockets = @import("sockets.zig");
+    const sockFd = try sockets.createTCPServerSocket();
+    defer _ = linux.close(sockFd);
+
+    try ring.pushBindIp4(sockFd, 1, "127.0.0.1", 60016, .{});
+    _ = try wait(&ring);
+    try ring.pushListen(sockFd, 1, 1, .{});
+    _ = try wait(&ring);
+
+    const connectIdx: u64 = 2;
+    const acceptIdx: u64 = 3;
+    const cancelIdx: u64 = 4;
+
+    // Arm the multishot accept first, then connect a client so the armed
+    // accept has something to deliver. An idle listener is not a usable
+    // trigger here: a multishot accept that finds no pending connection simply
+    // re-arms its poll without posting a CQE, so waiting for one would hang.
+    try ring.pushAcceptMultishot(sockFd, acceptIdx, .{});
+
+    const clientFd = try sockets.createTCPClientSocket(null);
+    defer _ = linux.close(clientFd);
+    try ring.pushConnectIp4(clientFd, connectIdx, "127.0.0.1", 60016, .{});
+
+    // Drain the connect and the accepted connection. The accepted fd carries
+    // hasMore, marking the multishot as still armed.
+    var acceptedFd: posix.fd_t = -1;
+    var sawConnect = false;
+    while (!sawConnect or acceptedFd < 0) {
+        const cqe = waitNoMatterWhat(&ring);
+        if (cqe.taskIdx() == connectIdx) {
+            try std.testing.expect(cqe.res >= 0);
+            sawConnect = true;
+        } else if (cqe.taskIdx() == acceptIdx) {
+            try std.testing.expect(cqe.res >= 0);
+            try std.testing.expect(cqe.hasMore());
+            acceptedFd = @intCast(cqe.res);
+        }
+    }
+    defer _ = linux.close(acceptedFd);
+
+    try ring.pushCancel(cancelIdx, acceptIdx, .{});
+
+    var sawCancel = false;
+    var sawAcceptEnd = false;
+    while (!sawCancel or !sawAcceptEnd) {
+        const cqe = waitNoMatterWhat(&ring);
+        if (cqe.taskIdx() == cancelIdx) {
+            // 0 means the matching request was found and canceled.
+            try std.testing.expectEqual(@as(i32, 0), cqe.res);
+            sawCancel = true;
+        } else if (cqe.taskIdx() == acceptIdx) {
+            // The final completion of a canceled multishot clears hasMore and
+            // reports -ECANCELED.
+            try std.testing.expect(!cqe.hasMore());
+            try std.testing.expectEqual(linux.E.CANCELED, cqe.errno());
+            sawAcceptEnd = true;
+        }
+    }
+}
+
+test "multishot ticker fires a limited number of ticks" {
+    const Manager = @import("ring_factory.zig").Factory;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var mgr = try Manager.init(arena.allocator(), 1);
+    defer mgr.deinit();
+
+    var ring = try mgr.acquireRing(128, 1);
+
+    const tickerIdx: u64 = 1;
+    const ticks: u32 = 3;
+
+    // The quantization is the interval between two consecutive ticks.
+    const quantization = linux.kernel_timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+
+    try ring.pushTicker(tickerIdx, &quantization, ticks, .{});
+
+    var fired: u32 = 0;
+    var lastNs = time.nowNs();
+    while (fired < ticks) {
+        const cqe = waitPeacefully(&ring);
+        if (cqe.taskIdx() != tickerIdx) continue;
+
+        // Every tick reports -ETIME in res; ETIME_SUCCESS only keeps it from
+        // being treated as a failed request.
+        try std.testing.expectEqual(linux.E.TIME, cqe.errno());
+
+        // Ticks arrive in order and, after the first, no sooner than one
+        // quantization apart (with a little slack for scheduling).
+        if (fired > 0) {
+            const nowNs = time.nowNs();
+            const deltaNs = nowNs - lastNs;
+            if (deltaNs < quantization.nsec - quantization.nsec / 4) {
+                std.debug.panic("ticks arrived too close: {}ns", .{deltaNs});
+            }
+            lastNs = nowNs;
+        }
+
+        fired += 1;
+
+        // hasMore stays set while the ticker is armed and clears on the last
+        // tick, which is the signal the ticker is done.
+        if (fired < ticks) {
+            try std.testing.expect(cqe.hasMore());
+        } else {
+            try std.testing.expect(!cqe.hasMore());
+        }
+    }
+
+    // The ticker stopped on its own: no further completion may arrive.
+    try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(60), .real);
+    try std.testing.expect(ring.popCQE() == null);
+}
+
+test "unlimited multishot ticker runs until canceled" {
+    const Manager = @import("ring_factory.zig").Factory;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var mgr = try Manager.init(arena.allocator(), 1);
+    defer mgr.deinit();
+
+    var ring = try mgr.acquireRing(128, 1);
+
+    const tickerIdx: u64 = 1;
+    const cancelIdx: u64 = 2;
+
+    const quantization = linux.kernel_timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+
+    // A zero tick limit means the ticker is indefinite.
+    try ring.pushTicker(tickerIdx, &quantization, 0, .{});
+
+    var fired: u32 = 0;
+    while (fired < 3) {
+        const cqe = waitPeacefully(&ring);
+        if (cqe.taskIdx() != tickerIdx) continue;
+        try std.testing.expectEqual(linux.E.TIME, cqe.errno());
+        try std.testing.expect(cqe.hasMore());
+        fired += 1;
+    }
+
+    try ring.pushCancel(cancelIdx, tickerIdx, .{});
+
+    var sawCancel = false;
+    var sawTickerEnd = false;
+    while (!sawCancel or !sawTickerEnd) {
+        const cqe = waitNoMatterWhat(&ring);
+        if (cqe.taskIdx() == cancelIdx) {
+            try std.testing.expectEqual(@as(i32, 0), cqe.res);
+            sawCancel = true;
+        } else if (cqe.taskIdx() == tickerIdx) {
+            // The final completion clears hasMore and reports -ECANCELED.
+            try std.testing.expect(!cqe.hasMore());
+            try std.testing.expectEqual(linux.E.CANCELED, cqe.errno());
+            sawTickerEnd = true;
+        }
+    }
+}
