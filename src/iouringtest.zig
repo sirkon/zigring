@@ -639,8 +639,10 @@ test "echo server and client" {
     // client ring. Sharing a single poller serializes both ends of the
     // connection on one CPU-bound kernel thread and roughly doubles the
     // round-trip time.
-    var mgr = try Manager.init(arena.allocator(), 2);
-    var barrier = pthread.Mutex.init();
+    var mgr: Manager = undefined;
+    try mgr.init(arena.allocator(), 2);
+    var barrier: pthread.Mutex = undefined;
+    barrier.initInPlace();
 
     const SharedState = struct {
         mgr: *Manager,
@@ -758,7 +760,8 @@ test "create and write file" {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
+    var mgr: Manager = undefined;
+    try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
     var ring = try mgr.acquireRing(128, 1);
@@ -801,7 +804,8 @@ test "write and read file at an explicit offset" {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
+    var mgr: Manager = undefined;
+    try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
     var ring = try mgr.acquireRing(128, 1);
@@ -852,7 +856,8 @@ test "writev and readv file" {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
+    var mgr: Manager = undefined;
+    try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
     var ring = try mgr.acquireRing(128, 1);
@@ -912,7 +917,8 @@ test "create a server and wait for 1 second for incoming connections what will n
     const Manager = @import("ring_factory.zig").Factory;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
+    var mgr: Manager = undefined;
+    try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
     var ring = try mgr.acquireRing(128, 1);
@@ -984,7 +990,8 @@ test "batchedCQ caps the drained entries" {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
+    var mgr: Manager = undefined;
+    try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
     var ring = try mgr.acquireRing(128, 1);
@@ -1045,7 +1052,8 @@ test "streamedSQ survives many commit rounds" {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
+    var mgr: Manager = undefined;
+    try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
     var ring = try mgr.acquireRing(8, 1);
@@ -1083,7 +1091,8 @@ test "one thread wakes another that is waiting on CQ" {
     const pthread = @import("pthread.zig");
     const Manager = @import("ring_factory.zig").Factory;
 
-    var mgr = try Manager.init(std.testing.allocator, 1);
+    var mgr: Manager = undefined;
+    try mgr.init(std.testing.allocator, 1);
     defer mgr.deinit();
     var r1 = try mgr.acquireRing(128, 1);
     var r2 = try mgr.acquireRing(128, 1);
@@ -1095,10 +1104,9 @@ test "one thread wakes another that is waiting on CQ" {
         ring: *Ring,
         lock: pthread.Mutex,
     };
-    var sharedState = SharedState{
-        .ring = &r2,
-        .lock = pthread.Mutex.init(),
-    };
+    var sharedState: SharedState = undefined;
+    sharedState.ring = &r2;
+    sharedState.lock.initInPlace();
     sharedState.lock.lock();
     const threadRunner = struct {
         fn run(state: *SharedState) void {
@@ -1137,7 +1145,8 @@ test "cancel an armed multishot accept" {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
+    var mgr: Manager = undefined;
+    try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
     var ring = try mgr.acquireRing(128, 1);
@@ -1207,7 +1216,8 @@ test "multishot ticker fires a limited number of ticks" {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
+    var mgr: Manager = undefined;
+    try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
     var ring = try mgr.acquireRing(128, 1);
@@ -1262,7 +1272,8 @@ test "unlimited multishot ticker runs until canceled" {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var mgr = try Manager.init(arena.allocator(), 1);
+    var mgr: Manager = undefined;
+    try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
     var ring = try mgr.acquireRing(128, 1);

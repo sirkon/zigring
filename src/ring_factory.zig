@@ -25,17 +25,21 @@ pub const Factory = struct {
         ringCount: u32,
     };
 
-    pub fn init(allocator: std.mem.Allocator, maxPollerThreads: u32) !Self {
+    /// Initializes the factory in place.
+    ///
+    /// The factory embeds a `pthread.Mutex`, which pthreads forbids copying
+    /// once initialized, so it is initialized at its final address rather than
+    /// returned by value.
+    pub fn init(self: *Self, allocator: std.mem.Allocator, maxPollerThreads: u32) !void {
         const groups = try std.ArrayList(PollerGroup).initCapacity(allocator, maxPollerThreads);
-        return .{
-            .maxPollerThreads = maxPollerThreads,
-            .allocator = allocator,
-            .groups = groups,
-            .mutex = pthread.Mutex.init(),
-        };
+        self.maxPollerThreads = maxPollerThreads;
+        self.allocator = allocator;
+        self.groups = groups;
+        self.mutex.initInPlace();
     }
 
     pub fn deinit(self: *Self) void {
+        self.mutex.deinit();
         self.groups.deinit(self.allocator);
     }
 

@@ -38,13 +38,21 @@ pub const Mutex = struct {
     /// same memory to be used for init, lock, unlock and destroy, so keep the
     /// returned value where it is.
     pub fn init() Mutex {
-        var self = Mutex{
-            // Properly zero the memory for the C struct
-            .raw = std.mem.zeroes(c.pthread_mutex_t),
-        };
+        var self: Mutex = undefined;
+        self.initInPlace();
+        return self;
+    }
+
+    /// Initializes the mutex directly at its final address.
+    ///
+    /// Prefer this over `init` when the `Mutex` is embedded in a larger struct:
+    /// it avoids returning the pthread object by value, which pthreads does not
+    /// permit once the mutex may be contended.
+    pub fn initInPlace(self: *Mutex) void {
+        // Properly zero the memory for the C struct
+        self.raw = std.mem.zeroes(c.pthread_mutex_t);
         // Initialize the mutex with default attributes (null)
         _ = pthread_mutex_init(&self.raw, null);
-        return self;
     }
 
     /// Destroys the mutex and releases any resources libc attached to it.
@@ -81,11 +89,19 @@ pub const CondVar = struct {
     /// Must be paired with `deinit` on the same instance; see the address
     /// stability note on `Mutex`.
     pub fn init() CondVar {
-        var self = CondVar{
-            .raw = std.mem.zeroes(c.pthread_cond_t),
-        };
-        _ = pthread_cond_init(&self.raw, null);
+        var self: CondVar = undefined;
+        self.initInPlace();
         return self;
+    }
+
+    /// Initializes the condition variable directly at its final address.
+    ///
+    /// Prefer this over `init` when the `CondVar` is embedded in a larger
+    /// struct: it avoids returning the pthread object by value, which pthreads
+    /// does not permit once the variable may have waiters.
+    pub fn initInPlace(self: *CondVar) void {
+        self.raw = std.mem.zeroes(c.pthread_cond_t);
+        _ = pthread_cond_init(&self.raw, null);
     }
 
     /// Destroys the condition variable.
@@ -222,12 +238,11 @@ test "pthread wrappers: mutex, condvar, and thread workflow" {
     };
 
     // Initialize our state
-    var state = SharedState{
-        .mutex = Mutex.init(),
-        .cond = CondVar.init(),
-        .ready = false,
-        .counter = 0,
-    };
+    var state: SharedState = undefined;
+    state.mutex.initInPlace();
+    state.cond.initInPlace();
+    state.ready = false;
+    state.counter = 0;
     defer state.mutex.deinit();
     defer state.cond.deinit();
 

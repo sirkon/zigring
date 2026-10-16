@@ -295,7 +295,7 @@ CQE reports `-ECANCELED` and the timeout CQE reports success (`res == 0`).
 ## `Factory`: threads and pollers
 
 ```zig
-pub fn init(allocator: std.mem.Allocator, maxPollerThreads: u32) !Self;
+pub fn init(self: *Self, allocator: std.mem.Allocator, maxPollerThreads: u32) !void;
 pub fn deinit(self: *Self) void;
 pub fn acquireRing(self: *Self, queueDepth: u32, weight: u32) !Ring;
 ```
@@ -308,8 +308,13 @@ rings; the caller owns and deinits each returned `Ring`. The **master ring**
 (the first one in a group) must outlive every ring attached to it, since
 attached rings share its kernel poller fd.
 
+`init` takes the factory by pointer and initializes it in place, because the
+factory embeds a `pthread.Mutex` and pthreads forbids copying an initialized
+mutex. Declare the factory as a local and pass its address:
+
 ```zig
-var mgr = try Factory.init(allocator, 2);
+var mgr: Factory = undefined;
+try mgr.init(allocator, 2);
 defer mgr.deinit();
 var ring = try mgr.acquireRing(4096, 1);
 defer ring.deinit();
@@ -433,8 +438,8 @@ const j = try bufs.alloc(); // index only
 ## Threading wrappers
 
 ```zig
-pub const Mutex = struct { init/deinit, lock, unlock };
-pub const CondVar = struct { init/deinit, wait(mutex), signal, broadcast };
+pub const Mutex = struct { init/initInPlace/deinit, lock, unlock };
+pub const CondVar = struct { init/initInPlace/deinit, wait(mutex), signal, broadcast };
 pub const Thread = struct {
     pub fn spawn(context: anytype, comptime f: anytype) !Thread;
     pub fn join(self: Thread) void;
@@ -446,6 +451,9 @@ pub const Thread = struct {
 - `Mutex`/`CondVar` embed the raw pthread object inline: they must live at a
   stable address, matching init/lock/wait/destroy on the same memory. Do not
   copy or move them once possibly contended.
+- When the object is embedded in a larger struct, use `initInPlace(&field)`
+  (or declare the struct and call `field.initInPlace()`) instead of assigning
+  `init()` into it, so the pthread object is never returned by value.
 - `CondVar.wait` must be called holding the mutex and always inside a loop that
   re-checks the predicate (wakeups may be spurious). `signal`/`broadcast` do
   not hand off the mutex.
