@@ -38,8 +38,10 @@ pub fn Slots(comptime T: type) type {
         ///
         /// `capacity` must be a power of two of at least 4096, and
         /// `child_count` may be zero for a table that never grows. The allocator
-        /// must outlive the slotter, since `deinit` frees through it.
-        pub fn init(allocator: std.mem.Allocator, capacity: u64, child_count: usize) !Self {
+        /// must outlive the slotter, since `deinit` frees through it. `self` must
+        /// point at storage that outlives the slotter; on failure it is left
+        /// untouched.
+        pub fn init(self: *Self, allocator: std.mem.Allocator, capacity: u64, child_count: usize) !void {
             // Checks for powers of two
             if (capacity == 0 or (capacity & (capacity - 1)) != 0) return error.CapacityMustBePowerOfTwo;
 
@@ -66,7 +68,7 @@ pub fn Slots(comptime T: type) type {
                 @memset(children.?, null);
             }
 
-            return Self{
+            self.* = .{
                 .allocator = allocator,
                 .cap = capacity,
                 .slots = slots,
@@ -127,7 +129,7 @@ pub fn Slots(comptime T: type) type {
                         errdefer self.allocator.destroy(child_ptr);
 
                         // Child slotters have size equal to fallback_cap and no children of their own (0)
-                        child_ptr.* = try Self.init(self.allocator, self.slots.len, 0);
+                        try child_ptr.init(self.allocator, self.slots.len, 0);
                         children_slice[i] = child_ptr;
                     }
 
@@ -277,14 +279,16 @@ pub const BufferSlots = struct {
     ///
     /// `capacity` must be a power of two of at least 4096, and `elementSize`
     /// must be non-zero (see the corresponding errors). The backing allocation
-    /// is owned by the returned value and freed by `deinit`; the allocator must
-    /// outlive the slotter.
+    /// is owned by the slotter and freed by `deinit`; the allocator must
+    /// outlive the slotter. `self` must point at storage that outlives the
+    /// slotter; on failure it is left untouched.
     pub fn init(
+        self: *Self,
         allocator: std.mem.Allocator,
         capacity: u64,
         elementSize: u64,
         childCount: usize,
-    ) !Self {
+    ) !void {
         if (capacity == 0 or (capacity & (capacity - 1)) != 0) return error.CapacityMustBePowerOfTwo;
 
         if (capacity < 4096) return error.CapacityTooSmall;
@@ -311,7 +315,7 @@ pub const BufferSlots = struct {
             @memset(children.?, null);
         }
 
-        return Self{
+        self.* = .{
             .allocator = allocator,
             .elementSize = elementSize,
             .cap = capacity,
@@ -379,7 +383,7 @@ pub const BufferSlots = struct {
                     const childPtr = try self.allocator.create(Self);
                     errdefer self.allocator.destroy(childPtr);
 
-                    childPtr.* = try Self.init(self.allocator, self.cap, self.elementSize, 0);
+                    try childPtr.init(self.allocator, self.cap, self.elementSize, 0);
                     childrenSlice[i] = childPtr;
                 }
 
@@ -516,7 +520,8 @@ test "test slots" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    var slots = try Slots(u64).init(arena.allocator(), 4096, 1);
+    var slots: Slots(u64) = undefined;
+    try slots.init(arena.allocator(), 4096, 1);
 
     var idx = try slots.add(100);
     const firstIdx = idx;
@@ -549,7 +554,8 @@ test "test slots dropUnused" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    var slots = try Slots(u64).init(arena.allocator(), 4096, 3);
+    var slots: Slots(u64) = undefined;
+    try slots.init(arena.allocator(), 4096, 3);
 
     // Fill the root and the first two children: 0..4095, 4096..8191 and
     // 8192..12287, all with matching values.
@@ -602,7 +608,8 @@ test "test buffer slots dropUnused" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    var slots = try BufferSlots.init(arena.allocator(), 4096, 16, 3);
+    var slots: BufferSlots = undefined;
+    try slots.init(arena.allocator(), 4096, 16, 3);
 
     // Fill the root and the first two children with 16-byte buffers.
     for (0..4096 * 3) |i| {

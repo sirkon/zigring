@@ -170,8 +170,8 @@ pub const Ring = struct {
     bufPools: [@typeInfo(BufferSizeClass).@"enum".fields.len]BufferPool =
         [_]BufferPool{undefined} ** @typeInfo(BufferSizeClass).@"enum".fields.len,
 
-    /// Creates a ring by calling `io_uring_setup` and mmapping the SQ ring, the
-    /// SQE array and the CQ ring.
+    /// Creates a ring in place by calling `io_uring_setup` and mmapping the SQ
+    /// ring, the SQE array and the CQ ring.
     ///
     /// `queueDepth` is the number of SQ entries and must be a power of two,
     /// otherwise `error.ZigRingRequiresDepthPowOf2` is returned. The ring runs
@@ -183,9 +183,10 @@ pub const Ring = struct {
     /// its own. That is how several rings can be served by one poller; the
     /// referenced ring must outlive this one.
     ///
-    /// The caller owns the returned value and must call `deinit` to unmap the
-    /// regions and close the fd.
-    pub fn init(queueDepth: u32, attachFd: ?posix.fd_t) !Self {
+    /// `self` must point at stable storage (the ring is never copied) and on
+    /// success must be released with `deinit`. On failure `self` is left
+    /// untouched.
+    pub fn init(self: *Self, queueDepth: u32, attachFd: ?posix.fd_t) !void {
         if (@popCount(queueDepth) != 1) {
             return error.ZigRingRequiresDepthPowOf2;
         }
@@ -242,7 +243,7 @@ pub const Ring = struct {
         const sqMaskPtr: *u32 = @ptrCast(@alignCast(sqBase + params.sq_off.ring_mask));
         const cqMaskPtr: *u32 = @ptrCast(@alignCast(cqBase + params.cq_off.ring_mask));
 
-        return Self{
+        self.* = .{
             .fd = ringFd,
             .flags = params.flags,
             .sqMmapPtr = sqMmap,
@@ -259,8 +260,14 @@ pub const Ring = struct {
             .cqTail = @ptrCast(@alignCast(cqBase + params.cq_off.tail)),
             .cqMask = cqMaskPtr.*,
             .cqEntries = @ptrCast(@alignCast(cqBase + params.cq_off.cqes)),
-            .bufPools = [_]BufferPool{BufferPool.initUninitialized()} ** @typeInfo(BufferSizeClass).@"enum".fields.len,
+            .bufPools = undefined,
         };
+
+        // No size class has a pool yet; marking them uninitialized keeps
+        // `deinit` and the buffer-select ops from touching garbage state.
+        for (&self.bufPools) |*pool| {
+            pool.initUninitialized();
+        }
     }
 
     /// Releases everything the ring owns: unmaps the SQ ring, the SQE array and
@@ -298,7 +305,7 @@ pub const Ring = struct {
             return error.BufferOfSizeAlreadyInitialized;
         }
 
-        bufPool.* = try BufferPool.init(self.fd, idx, entries, sizeClass.size());
+        try bufPool.init(self.fd, idx, entries, sizeClass.size());
     }
 
     // 2 MiB huge page size.
@@ -2204,8 +2211,8 @@ pub const ReorderBuffer = struct {
     first: i32, // head of the list
     last: i32, // tail of the list
 
-    /// Creates a reorder buffer that holds up to `size` in-flight items of
-    /// `itemSize` bytes each.
+    /// Creates in place a reorder buffer that holds up to `size` in-flight items
+    /// of `itemSize` bytes each.
     ///
     /// `size` is the reorder window: an item may arrive at most `size - 1`
     /// positions ahead of the next expected sequence index, otherwise `push`
@@ -2214,9 +2221,9 @@ pub const ReorderBuffer = struct {
     /// `error.ReorderBufferNoMoreThan32KibItems` is returned. The backing
     /// storage is `2 * size` slots, one ring length of headroom.
     ///
-    /// The caller owns the returned value and must call `deinit` to release the
-    /// item buffer and the two link arrays.
-    pub fn init(allocator: std.mem.Allocator, size: usize, itemSize: usize) !Self {
+    /// `self` must point at storage that outlives the buffer; on success it
+    /// must be released with `deinit`. On failure `self` is left untouched.
+    pub fn init(self: *Self, allocator: std.mem.Allocator, size: usize, itemSize: usize) !void {
         if (@popCount(size) != 1) {
             return error.ReorderBufferSizeMustBeAPowOf2;
         }
@@ -2237,7 +2244,7 @@ pub const ReorderBuffer = struct {
         @memset(nexts, -1);
         @memset(prevs, -1);
 
-        return Self{
+        self.* = .{
             .allocator = allocator,
             .buf = buf,
             .nexts = nexts,

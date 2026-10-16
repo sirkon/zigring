@@ -78,7 +78,8 @@ fn waitOne(ring: *Ring) zigring.CQE {
 }
 
 pub fn main() !void {
-    var ring = try Ring.init(64, null); // queueDepth must be a power of two
+    var ring: Ring = undefined;
+    try ring.init(64, null); // queueDepth must be a power of two
     defer ring.deinit();
 
     // Arm an operation. `taskIdx` is opaque user data echoed back in the CQE.
@@ -95,7 +96,7 @@ pub fn main() !void {
 ## `Ring`: signatures and gotchas
 
 ```zig
-pub fn init(queueDepth: u32, attachFd: ?posix.fd_t) !Self;
+pub fn init(self: *Self, queueDepth: u32, attachFd: ?posix.fd_t) !void;
 pub fn deinit(self: *Self) void;
 ```
 
@@ -297,26 +298,29 @@ CQE reports `-ECANCELED` and the timeout CQE reports success (`res == 0`).
 ```zig
 pub fn init(self: *Self, allocator: std.mem.Allocator, maxPollerThreads: u32) !void;
 pub fn deinit(self: *Self) void;
-pub fn acquireRing(self: *Self, queueDepth: u32, weight: u32) !Ring;
+pub fn acquireRing(self: *Self, ring: *Ring, queueDepth: u32, weight: u32) !void;
 ```
 
 Thread-safe. `acquireRing` picks the poller with the least accumulated `weight`
 and attaches a new ring to it (`IORING_SETUP_ATTACH_WQ`); it starts a new poller
 only while fewer than `maxPollerThreads` exist and the best one still has load.
 `weight` is your estimate of how much work the ring will do. The factory owns no
-rings; the caller owns and deinits each returned `Ring`. The **master ring**
-(the first one in a group) must outlive every ring attached to it, since
-attached rings share its kernel poller fd.
+rings; the caller owns the storage passed to `acquireRing` and deinits each
+`Ring`. The **master ring** (the first one in a group) must outlive every ring
+attached to it, since attached rings share its kernel poller fd.
 
-`init` takes the factory by pointer and initializes it in place, because the
-factory embeds a `pthread.Mutex` and pthreads forbids copying an initialized
-mutex. Declare the factory as a local and pass its address:
+Every constructor in this library is in place: `init`/`spawn`/`acquireRing` take
+a `*Self` as their first argument and write into it, so the object is never
+returned by value. Declare the object (`undefined`) and pass its address. `init`
+on the factory is in place in particular because it embeds a `pthread.Mutex` and
+pthreads forbids copying an initialized mutex:
 
 ```zig
 var mgr: Factory = undefined;
 try mgr.init(allocator, 2);
 defer mgr.deinit();
-var ring = try mgr.acquireRing(4096, 1);
+var ring: Ring = undefined;
+try mgr.acquireRing(&ring, 4096, 1);
 defer ring.deinit();
 ```
 
@@ -377,7 +381,8 @@ multishot or concurrent ops). Items are tagged with an absolute sequence index
 and released only once every earlier index has arrived.
 
 ```zig
-var rb = try ReorderBuffer.init(allocator, 128, 21); // size pow2, <= 0xFFFF
+var rb: ReorderBuffer = undefined;
+try rb.init(allocator, 128, 21); // size pow2, <= 0xFFFF
 defer rb.deinit();
 
 rb.push(seqIdx, bytes) catch |err| switch (err) {
@@ -410,13 +415,15 @@ table of `capacity` slots plus up to `childCount` lazily created child tables,
 for `capacity * (1 + childCount)` values total.
 
 ```zig
-var slots = try Slots(u64).init(allocator, 4096, 1); // cap pow2, >= 4096
+var slots: Slots(u64) = undefined;
+try slots.init(allocator, 4096, 1); // cap pow2, >= 4096
 defer slots.deinit();
 const i = try slots.add(42);
 _ = slots.get(i); // ?u64
 slots.del(i);
 
-var bufs = try BufferSlots.init(allocator, 16384, 32, 4); // 16384 * 32-byte buffers, 4 children
+var bufs: BufferSlots = undefined;
+try bufs.init(allocator, 16384, 32, 4); // 16384 * 32-byte buffers, 4 children
 defer bufs.deinit();
 const add = try bufs.addSlot(); // { .idx, .slice } aliases backing memory
 @memcpy(add.slice, payload);
@@ -438,10 +445,10 @@ const j = try bufs.alloc(); // index only
 ## Threading wrappers
 
 ```zig
-pub const Mutex = struct { init/initInPlace/deinit, lock, unlock };
-pub const CondVar = struct { init/initInPlace/deinit, wait(mutex), signal, broadcast };
+pub const Mutex = struct { init(*Mutex)/deinit, lock, unlock };
+pub const CondVar = struct { init(*CondVar)/deinit, wait(mutex), signal, broadcast };
 pub const Thread = struct {
-    pub fn spawn(context: anytype, comptime f: anytype) !Thread;
+    pub fn spawn(self: *Thread, context: anytype, comptime f: anytype) !void;
     pub fn join(self: Thread) void;
     pub fn setAffinity(self: Thread, coreId: u32) !void;
     pub fn setSelfAffinity(coreId: u32) !void;
@@ -451,13 +458,13 @@ pub const Thread = struct {
 - `Mutex`/`CondVar` embed the raw pthread object inline: they must live at a
   stable address, matching init/lock/wait/destroy on the same memory. Do not
   copy or move them once possibly contended.
-- When the object is embedded in a larger struct, use `initInPlace(&field)`
-  (or declare the struct and call `field.initInPlace()`) instead of assigning
-  `init()` into it, so the pthread object is never returned by value.
+- `init` takes the object by pointer and initializes it in place (there is no
+  value-returning form), so the pthread object is never returned by value.
+  Initialize a local or embedded field with `obj.init()`.
 - `CondVar.wait` must be called holding the mutex and always inside a loop that
   re-checks the predicate (wakeups may be spurious). `signal`/`broadcast` do
   not hand off the mutex.
-- `Thread.spawn(context, f)`: `context` may be a pointer (the pointee must
+- `Thread.spawn(self, context, f)`: `context` may be a pointer (the pointee must
   outlive the thread until `join`) or `void`/`null`. Failure returns
   `error.ThreadSpawnFailed`. Every successful spawn needs exactly one `join`
   (not from the thread itself), else resources leak.
@@ -468,7 +475,8 @@ pub const Thread = struct {
 const worker = struct {
     fn run(state: *Shared) void { /* ... */ }
 }.run;
-const t = try Thread.spawn(&state, worker);
+var t: Thread = undefined;
+try t.spawn(&state, worker);
 t.join();
 ```
 

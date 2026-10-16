@@ -14,7 +14,8 @@ fn wait(ring: *Ring) !CQE {
 }
 
 test "SendZC sends a slice of a registered buffer" {
-    var ring = try Ring.init(64, null);
+    var ring: Ring = undefined;
+    try ring.init(64, null);
     defer ring.deinit();
 
     // Set up a connected TCP loopback pair on the same ring.

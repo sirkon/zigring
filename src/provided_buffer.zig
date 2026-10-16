@@ -61,18 +61,26 @@ pub const ProvidedBufferPool = struct {
     bufRingMmap: []align(std.heap.page_size_min) u8,
     memoryBackingMmap: []align(std.heap.page_size_min) u8,
 
-    pub fn initUninitialized() Self {
-        var s: Self = undefined;
-        s.notInitalized = true;
-        return s;
+    /// Marks `self` as not yet initialized, so `deinit`, `releaseBuffer`,
+    /// `buffer` and `replenishAll` all become harmless no-ops. Used to fill
+    /// the ring's pool slots before any pool is registered.
+    pub fn initUninitialized(self: *Self) void {
+        self.notInitalized = true;
     }
 
+    /// Registers a kernel-provided buffer ring for `entries` buffers of
+    /// `bufferSize` bytes in place, on ring fd `ringFd` under group id `bgid`.
+    ///
+    /// `entries` must be a power of two and the element array must be at least
+    /// 32 bytes, else `error.EntriesMustBePowerOf2` or
+    /// `error.BufferRingTooSmall`. On any failure `self` is left untouched.
     pub fn init(
+        self: *Self,
         ringFd: posix.fd_t,
         bgid: u16,
         entries: u32,
         bufferSize: u32,
-    ) !Self {
+    ) !void {
         // Protect indices against non power-of-two rings.
         if (@popCount(entries) != 1) return error.EntriesMustBePowerOf2;
 
@@ -108,7 +116,7 @@ pub const ProvidedBufferPool = struct {
             return error.RegisterBufRingFailed;
         }
 
-        var self = Self{
+        self.* = .{
             .notInitalized = false,
             .ringFd = ringFd,
             .bgid = bgid,
@@ -123,8 +131,6 @@ pub const ProvidedBufferPool = struct {
         // Publish every buffer to the kernel before the ring is handed back,
         // so buffer-select operations never start from an empty pool.
         self.replenishAll();
-
-        return self;
     }
 
     pub fn deinit(self: *Self) void {

@@ -32,23 +32,14 @@ extern "c" fn pthread_self() c.pthread_t;
 pub const Mutex = struct {
     raw: c.pthread_mutex_t,
 
-    /// Initializes the mutex with default (process-private) attributes.
+    /// Initializes the mutex with default (process-private) attributes at its
+    /// final address.
     ///
     /// Must be paired with `deinit` on the same instance. Pthreads requires the
-    /// same memory to be used for init, lock, unlock and destroy, so keep the
-    /// returned value where it is.
-    pub fn init() Mutex {
-        var self: Mutex = undefined;
-        self.initInPlace();
-        return self;
-    }
-
-    /// Initializes the mutex directly at its final address.
-    ///
-    /// Prefer this over `init` when the `Mutex` is embedded in a larger struct:
-    /// it avoids returning the pthread object by value, which pthreads does not
-    /// permit once the mutex may be contended.
-    pub fn initInPlace(self: *Mutex) void {
+    /// same memory to be used for init, lock, unlock and destroy, so the mutex
+    /// must stay at a stable address for its whole lifetime; it is never
+    /// returned by value.
+    pub fn init(self: *Mutex) void {
         // Properly zero the memory for the C struct
         self.raw = std.mem.zeroes(c.pthread_mutex_t);
         // Initialize the mutex with default attributes (null)
@@ -84,22 +75,12 @@ pub const Mutex = struct {
 pub const CondVar = struct {
     raw: c.pthread_cond_t,
 
-    /// Initializes the condition variable with default attributes.
+    /// Initializes the condition variable with default attributes at its final
+    /// address.
     ///
     /// Must be paired with `deinit` on the same instance; see the address
-    /// stability note on `Mutex`.
-    pub fn init() CondVar {
-        var self: CondVar = undefined;
-        self.initInPlace();
-        return self;
-    }
-
-    /// Initializes the condition variable directly at its final address.
-    ///
-    /// Prefer this over `init` when the `CondVar` is embedded in a larger
-    /// struct: it avoids returning the pthread object by value, which pthreads
-    /// does not permit once the variable may have waiters.
-    pub fn initInPlace(self: *CondVar) void {
+    /// stability note on `Mutex`. It is never returned by value.
+    pub fn init(self: *CondVar) void {
         self.raw = std.mem.zeroes(c.pthread_cond_t);
         _ = pthread_cond_init(&self.raw, null);
     }
@@ -147,14 +128,15 @@ pub const CondVar = struct {
 pub const Thread = struct {
     raw: c.pthread_t,
 
-    /// Spawns a new thread that runs `f`.
+    /// Spawns a new thread that runs `f`, storing the handle in `self`.
     ///
     /// `context` must be a pointer (or `void`/`null` for a context-free
     /// function); the thread invokes `f(context)`. Only the pointer value is
     /// copied into the thread, not the pointed-to data, so the pointee must
     /// stay alive until the thread is joined. Returns
-    /// `error.ThreadSpawnFailed` on failure, in which case nothing was created.
-    pub fn spawn(context: anytype, comptime f: anytype) !Thread {
+    /// `error.ThreadSpawnFailed` on failure, in which case nothing was created
+    /// and `self` is left untouched.
+    pub fn spawn(self: *Thread, context: anytype, comptime f: anytype) !void {
         const ContextType = @TypeOf(context);
 
         const wrapper = struct {
@@ -169,11 +151,6 @@ pub const Thread = struct {
             }
         }.run;
 
-        // Create the struct with uninitialized (garbage) state
-        var self = Thread{
-            .raw = undefined,
-        };
-
         // Zero the thread handle's raw memory directly, byte by byte
         // This bypasses Zig's type checks and works on any OS/libc
         const bytes = @as([*]u8, @ptrCast(&self.raw))[0..@sizeOf(c.pthread_t)];
@@ -183,8 +160,6 @@ pub const Thread = struct {
 
         const res = pthread_create(&self.raw, null, @ptrCast(&wrapper), raw_arg);
         if (res != 0) return error.ThreadSpawnFailed;
-
-        return self;
     }
 
     /// Waits for the thread to finish and releases its resources.
@@ -239,8 +214,8 @@ test "pthread wrappers: mutex, condvar, and thread workflow" {
 
     // Initialize our state
     var state: SharedState = undefined;
-    state.mutex.initInPlace();
-    state.cond.initInPlace();
+    state.mutex.init();
+    state.cond.init();
     state.ready = false;
     state.counter = 0;
     defer state.mutex.deinit();
@@ -263,7 +238,8 @@ test "pthread wrappers: mutex, condvar, and thread workflow" {
     }.run;
 
     // 1. Spawn the thread
-    const thread = try Thread.spawn(&state, worker);
+    var thread: Thread = undefined;
+    try thread.spawn(&state, worker);
 
     // Give the background thread time to start and block in cond.wait()
     try std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(10), .awake);

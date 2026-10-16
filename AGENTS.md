@@ -60,6 +60,12 @@ The integration tests model application logic as explicit FSMs (`echoServerFSM`,
   this density when editing.
 - Types are allocated and passed by pointer (`*Self`) with explicit `init`/
   `deinit` pairs; allocator must outlive the object.
+- **Constructors are in place.** Every initializer takes `self: *Self` as its
+  first parameter and returns `!void` (or `void`): `init(self, ...)`,
+  `Thread.spawn(self, ...)`, `Factory.acquireRing(self, ring, ...)`. No
+  constructor returns the object by value. Callers declare the object
+  (`undefined`, or a stable local/field) and pass its address. `Mutex`/`CondVar`
+  have no value-returning form at all.
 - **Do not "fix" the public API spelling/typos.** `regiterSizeClassReceiveBuffer`
   (missing `s`) and `ProvidedBufferPool.notInitalized` are load-bearing public
   names. Renaming them breaks downstream code; only change names the user asks for.
@@ -102,8 +108,9 @@ The integration tests model application logic as explicit FSMs (`echoServerFSM`,
   returned slice is what gets `munmap`ed.
 - **`IORING_REGISTER_PBUF_RING = 22` is hardcoded on purpose** because the
   `IORING_REGISTER` enum ordering is not stable across kernels.
-- `ring_factory.acquireRing(queueDepth, weight)` uses weight to pick the poller
-  with the least load and refuses to build a new poller past `maxPollerThreads`.
+- `ring_factory.acquireRing(ring, queueDepth, weight)` uses weight to pick the
+  poller with the least load and refuses to build a new poller past
+  `maxPollerThreads`. It initializes the ring in place at the given pointer.
 
 ## Testing patterns
 

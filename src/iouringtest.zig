@@ -74,14 +74,15 @@ const echoServerFSM = struct {
     recvArmed: bool,
 
     fn init(
+        self: *Self,
         allocator: std.mem.Allocator,
         ring: *Ring,
         slots: *slotter.BufferSlots,
         clientFd: posix.fd_t,
         ordbuf: *ReorderBuffer,
         limit: u64,
-    ) !Self {
-        return Self{
+    ) !void {
+        self.* = Self{
             .allocator = allocator,
             .ring = ring,
             .slots = slots,
@@ -277,13 +278,14 @@ const echoClientFSM = struct {
     recvArmed: bool = false,
 
     fn init(
+        self: *Self,
         allocator: std.mem.Allocator,
         ring: *Ring,
         slots: *slotter.BufferSlots,
         serverFd: posix.fd_t,
         limit: u64,
-    ) !Self {
-        return Self{
+    ) !void {
+        self.* = Self{
             .allocator = allocator,
             .ring = ring,
             .slots = slots,
@@ -550,7 +552,8 @@ test "reorder buffer" {
 
     {
         // Write-delete-write-delete.
-        var ordbuf = try ReorderBuffer.init(arena.allocator(), 128, 1);
+        var ordbuf: ReorderBuffer = undefined;
+        try ordbuf.init(arena.allocator(), 128, 1);
         defer ordbuf.deinit();
         for (0..1000) |i| {
             const buf = [1]u8{@truncate(i)};
@@ -566,7 +569,8 @@ test "reorder buffer" {
 
     {
         // Write 1-2, add 0, write 4-5, add 3. And so on for a while.
-        var ordbuf = try ReorderBuffer.init(arena.allocator(), 128, 1);
+        var ordbuf: ReorderBuffer = undefined;
+        try ordbuf.init(arena.allocator(), 128, 1);
         defer ordbuf.deinit();
         for (0..15) |i| {
             const tasks = [3]u64{
@@ -642,7 +646,7 @@ test "echo server and client" {
     var mgr: Manager = undefined;
     try mgr.init(arena.allocator(), 2);
     var barrier: pthread.Mutex = undefined;
-    barrier.initInPlace();
+    barrier.init();
 
     const SharedState = struct {
         mgr: *Manager,
@@ -659,12 +663,15 @@ test "echo server and client" {
             //     std.debug.panic("failed to bind server thread to P-core 2: {any}\n", .{err});
             // };
 
-            var ring: Ring = must("create server ring", state.mgr.acquireRing(4096, 1));
+            var ring: Ring = undefined;
+            must("create server ring", state.mgr.acquireRing(&ring, 4096, 1));
             defer ring.deinit();
             must("create proved buffer", ring.regiterSizeClassReceiveBuffer(.tiny, 16384));
             var serverArena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            var slots: slotter.BufferSlots = must("create buffer slots", slotter.BufferSlots.init(serverArena.allocator(), 16384, 32, 4));
-            var ordbuf = must("create reorder buffer", ReorderBuffer.init(serverArena.allocator(), 128, 21));
+            var slots: slotter.BufferSlots = undefined;
+            must("create buffer slots", slots.init(serverArena.allocator(), 16384, 32, 4));
+            var ordbuf: ReorderBuffer = undefined;
+            must("create reorder buffer", ordbuf.init(serverArena.allocator(), 128, 21));
 
             // Create socket, bind it and start listening.
             const sockets = @import("sockets.zig");
@@ -681,7 +688,8 @@ test "echo server and client" {
             // Push accepts until there's a client.
             const clientFd = must("wait and accept the client", getAcceptedConn(&ring, sockFd));
 
-            var fsm = must("create server fsm", echoServerFSM.init(serverArena.allocator(), &ring, &slots, clientFd, &ordbuf, noOfRequests));
+            var fsm: echoServerFSM = undefined;
+            must("create server fsm", fsm.init(serverArena.allocator(), &ring, &slots, clientFd, &ordbuf, noOfRequests));
             defer fsm.deinit();
 
             while (!fsm.done()) {
@@ -703,7 +711,8 @@ test "echo server and client" {
             // };
 
             // Acquire the ring and initialize the HugePage buffers
-            var ring: Ring = must("create client ring", state.mgr.acquireRing(4096, 1));
+            var ring: Ring = undefined;
+            must("create client ring", state.mgr.acquireRing(&ring, 4096, 1));
             defer ring.deinit();
             must("initialize client buffer class", ring.regiterSizeClassReceiveBuffer(.tiny, 16384));
 
@@ -711,7 +720,8 @@ test "echo server and client" {
             defer clientArena.deinit();
 
             // Slotter for tracking the tasks being sent
-            var slots: slotter.BufferSlots = must("create client buffer slots", slotter.BufferSlots.init(clientArena.allocator(), 16384, 128, 4));
+            var slots: slotter.BufferSlots = undefined;
+            must("create client buffer slots", slots.init(clientArena.allocator(), 16384, 128, 4));
 
             // Connect to the server (via the socket helpers)
             const sockets = @import("sockets.zig");
@@ -729,7 +739,8 @@ test "echo server and client" {
             if (cqe.res < 0) {
                 std.debug.panic("failed to connect to the server: {}", .{linux.errno(cqe.result())});
             }
-            var fsm = must("create client fsm", echoClientFSM.init(clientArena.allocator(), &ring, &slots, clientFd, noOfRequests));
+            var fsm: echoClientFSM = undefined;
+            must("create client fsm", fsm.init(clientArena.allocator(), &ring, &slots, clientFd, noOfRequests));
 
             const start = time.nowNs();
             while (!fsm.done()) {
@@ -748,8 +759,10 @@ test "echo server and client" {
     }.run;
 
     sharedState.barrier.lock();
-    const serverThread = try pthread.Thread.spawn(&sharedState, serverWorker);
-    const clientThread = try pthread.Thread.spawn(&sharedState, clientWorker);
+    var serverThread: pthread.Thread = undefined;
+    try serverThread.spawn(&sharedState, serverWorker);
+    var clientThread: pthread.Thread = undefined;
+    try clientThread.spawn(&sharedState, clientWorker);
 
     serverThread.join();
     clientThread.join();
@@ -764,7 +777,8 @@ test "create and write file" {
     try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
-    var ring = try mgr.acquireRing(128, 1);
+    var ring: Ring = undefined;
+    try mgr.acquireRing(&ring, 128, 1);
     try ring.pushOpenDir(1, 0, "/tmp", .{});
 
     try ring.regiterSizeClassReceiveBuffer(.page, 1024);
@@ -808,7 +822,8 @@ test "write and read file at an explicit offset" {
     try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
-    var ring = try mgr.acquireRing(128, 1);
+    var ring: Ring = undefined;
+    try mgr.acquireRing(&ring, 128, 1);
     try ring.pushOpenDir(1, 0, "/tmp", .{});
     var cqe = try wait(&ring);
     const dirFd = cqe.res;
@@ -860,7 +875,8 @@ test "writev and readv file" {
     try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
-    var ring = try mgr.acquireRing(128, 1);
+    var ring: Ring = undefined;
+    try mgr.acquireRing(&ring, 128, 1);
 
     try ring.pushOpenDir(1, 0, "/tmp", .{});
     var cqe = try wait(&ring);
@@ -921,7 +937,8 @@ test "create a server and wait for 1 second for incoming connections what will n
     try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
-    var ring = try mgr.acquireRing(128, 1);
+    var ring: Ring = undefined;
+    try mgr.acquireRing(&ring, 128, 1);
 
     const sockets = @import("sockets.zig");
     const sockFd = try sockets.createTCPServerSocket();
@@ -994,7 +1011,8 @@ test "batchedCQ caps the drained entries" {
     try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
-    var ring = try mgr.acquireRing(128, 1);
+    var ring: Ring = undefined;
+    try mgr.acquireRing(&ring, 128, 1);
 
     try ring.pushOpenDir(1, 0, "/tmp", .{});
     const dirCqe = try wait(&ring);
@@ -1056,7 +1074,8 @@ test "streamedSQ survives many commit rounds" {
     try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
-    var ring = try mgr.acquireRing(8, 1);
+    var ring: Ring = undefined;
+    try mgr.acquireRing(&ring, 8, 1);
 
     try ring.pushOpenDir(1, 0, "/tmp", .{});
     var cqe = try wait(&ring);
@@ -1094,8 +1113,10 @@ test "one thread wakes another that is waiting on CQ" {
     var mgr: Manager = undefined;
     try mgr.init(std.testing.allocator, 1);
     defer mgr.deinit();
-    var r1 = try mgr.acquireRing(128, 1);
-    var r2 = try mgr.acquireRing(128, 1);
+    var r1: Ring = undefined;
+    try mgr.acquireRing(&r1, 128, 1);
+    var r2: Ring = undefined;
+    try mgr.acquireRing(&r2, 128, 1);
 
     const taskIdx: u64 = 1;
     const msgIdx: u32 = 2;
@@ -1106,7 +1127,7 @@ test "one thread wakes another that is waiting on CQ" {
     };
     var sharedState: SharedState = undefined;
     sharedState.ring = &r2;
-    sharedState.lock.initInPlace();
+    sharedState.lock.init();
     sharedState.lock.lock();
     const threadRunner = struct {
         fn run(state: *SharedState) void {
@@ -1129,7 +1150,8 @@ test "one thread wakes another that is waiting on CQ" {
         }
     }.run;
 
-    const thread = try pthread.Thread.spawn(&sharedState, threadRunner);
+    var thread: pthread.Thread = undefined;
+    try thread.spawn(&sharedState, threadRunner);
     sharedState.lock.lock();
     sharedState.lock.unlock();
 
@@ -1149,7 +1171,8 @@ test "cancel an armed multishot accept" {
     try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
-    var ring = try mgr.acquireRing(128, 1);
+    var ring: Ring = undefined;
+    try mgr.acquireRing(&ring, 128, 1);
 
     const sockets = @import("sockets.zig");
     const sockFd = try sockets.createTCPServerSocket();
@@ -1220,7 +1243,8 @@ test "multishot ticker fires a limited number of ticks" {
     try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
-    var ring = try mgr.acquireRing(128, 1);
+    var ring: Ring = undefined;
+    try mgr.acquireRing(&ring, 128, 1);
 
     const tickerIdx: u64 = 1;
     const ticks: u32 = 3;
@@ -1276,7 +1300,8 @@ test "unlimited multishot ticker runs until canceled" {
     try mgr.init(arena.allocator(), 1);
     defer mgr.deinit();
 
-    var ring = try mgr.acquireRing(128, 1);
+    var ring: Ring = undefined;
+    try mgr.acquireRing(&ring, 128, 1);
 
     const tickerIdx: u64 = 1;
     const cancelIdx: u64 = 2;

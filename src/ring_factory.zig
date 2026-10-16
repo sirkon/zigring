@@ -35,7 +35,7 @@ pub const Factory = struct {
         self.maxPollerThreads = maxPollerThreads;
         self.allocator = allocator;
         self.groups = groups;
-        self.mutex.initInPlace();
+        self.mutex.init();
     }
 
     pub fn deinit(self: *Self) void {
@@ -43,8 +43,12 @@ pub const Factory = struct {
         self.groups.deinit(self.allocator);
     }
 
-    /// Thread-safe method to request a new ring with the given "weight"
-    pub fn acquireRing(self: *Self, queueDepth: u32, weight: u32) !Ring {
+    /// Thread-safe method to acquire a new ring with the given "weight",
+    /// initialized in place at `ring`.
+    ///
+    /// `ring` must point at storage that outlives the ring. On failure it is
+    /// left untouched and nothing is registered with the factory.
+    pub fn acquireRing(self: *Self, ring: *Ring, queueDepth: u32, weight: u32) !void {
         // Lock the mutex on entry. Released automatically when leaving the function (scope-based)
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -68,31 +72,29 @@ pub const Factory = struct {
             (self.groups.items.len < self.maxPollerThreads and minWeightFound > 0))
         {
             // Create a new master thread.
-            const ring = try Ring.init(queueDepth, null);
+            try ring.init(queueDepth, null);
 
             // Register new group of rings for the master thread.
-            try self.groups.append(self.allocator, .{
+            self.groups.append(self.allocator, .{
                 .masterFd = ring.fd,
                 .currentWeight = weight,
                 .ringCount = 1,
-            });
+            }) catch |err| {
+                ring.deinit();
+                return err;
+            };
 
-            return ring;
+            return;
         }
 
         // Step 3: We are here because the limit of kernel polling threads is reached,
         // and we must attach a new ring to the existing kernel thread.
         const targetGroup = &self.groups.items[bestGroupIdx.?];
 
-        const ring = try Ring.init(
-            queueDepth,
-            targetGroup.masterFd,
-        );
+        try ring.init(queueDepth, targetGroup.masterFd);
 
         // Update group metrics.
         targetGroup.currentWeight += weight;
         targetGroup.ringCount += 1;
-
-        return ring;
     }
 };
