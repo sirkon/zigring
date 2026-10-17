@@ -7,12 +7,14 @@
 `@import("zigring")`. The public surface is `src/root.zig`; everything else in
 `src/` is a private implementation detail.
 
-- Toolchain: **Zig 0.16.0** (`build.zig.zon` pins `minimum_zig_version`).
+- Toolchain: **Zig 0.17.0** (`build.zig.zon` pins `minimum_zig_version`).
 - Target: **Linux only**, **libc required**. The build sets `link_libc = true`
   because the pthread wrappers call real `pthread_*` symbols and the ring uses
   raw syscalls. Do not remove it.
-- Uses Zig 0.16 std APIs (`std.Io.sleep(io, ...)`, `std.testing.io`); older
-  std-before-async snippets will not compile.
+- Uses Zig 0.17 std APIs (`std.Io.sleep(io, ...)`, `std.testing.io`); older
+  std-before-async snippets will not compile. Note 0.17 renames:
+  `@intFromEnum` → `@backingInt`, array repetition `x ** n` → `@splat(x)`, and
+  `@typeInfo(T).@"enum".fields` → `.field_names`.
 
 ## Commands
 

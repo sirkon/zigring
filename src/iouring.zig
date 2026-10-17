@@ -35,7 +35,7 @@ pub const BufferSizeClass = enum(u16) {
 
     /// Returns bgid for the given SizeClass.
     pub inline fn bgid(self: BufferSizeClass) usize {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -167,8 +167,8 @@ pub const Ring = struct {
     cqMask: u32,
     cqEntries: [*]CQE,
 
-    bufPools: [@typeInfo(BufferSizeClass).@"enum".fields.len]BufferPool =
-        [_]BufferPool{undefined} ** @typeInfo(BufferSizeClass).@"enum".fields.len,
+    bufPools: [@typeInfo(BufferSizeClass).@"enum".field_names.len]BufferPool =
+        @splat(undefined),
 
     /// Creates a ring in place by calling `io_uring_setup` and mmapping the SQ
     /// ring, the SQE array and the CQ ring.
@@ -299,7 +299,7 @@ pub const Ring = struct {
     /// The pool backs `pushReadZC`/`pushRecvZC`/`pushRecvMultishotZC` for that
     /// class and is owned and freed by the ring itself, not by the caller.
     pub fn regiterSizeClassReceiveBuffer(self: *Self, sizeClass: BufferSizeClass, entries: u32) !void {
-        const idx = @intFromEnum(sizeClass);
+        const idx = @backingInt(sizeClass);
         const bufPool = &self.bufPools[idx];
         if (!bufPool.isInactive()) {
             return error.BufferOfSizeAlreadyInitialized;
@@ -354,7 +354,7 @@ pub const Ring = struct {
         const res = std.os.linux.syscall4(
             .io_uring_register,
             @intCast(self.fd),
-            @intFromEnum(linux.IORING_REGISTER.REGISTER_BUFFERS),
+            @backingInt(linux.IORING_REGISTER.REGISTER_BUFFERS),
             @intFromPtr(iovecs.ptr),
             entries,
         );
@@ -662,7 +662,7 @@ pub const Ring = struct {
         size: BufferSizeClass,
         flags: TaskFlags,
     ) !void {
-        const bgid = @intFromEnum(size);
+        const bgid = @backingInt(size);
         if (self.bufPools[bgid].isInactive()) {
             @branchHint(.cold);
             return error.BufferPoolNotInitialized;
@@ -784,7 +784,7 @@ pub const Ring = struct {
         size: BufferSizeClass,
         flags: TaskFlags,
     ) !void {
-        const bgid = @intFromEnum(size);
+        const bgid = @backingInt(size);
         if (self.bufPools[bgid].isInactive()) {
             @branchHint(.cold);
             return error.BufferPoolNotInitialized;
@@ -845,7 +845,7 @@ pub const Ring = struct {
         size: BufferSizeClass,
         flags: TaskFlags,
     ) !void {
-        const bgid = @intFromEnum(size);
+        const bgid = @backingInt(size);
         if (self.bufPools[bgid].isInactive()) {
             @branchHint(.cold);
             return error.BufferPoolNotInitialized;
