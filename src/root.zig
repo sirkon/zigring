@@ -50,7 +50,8 @@ pub const CQE = ring.CQE;
 /// `commit`, collapsing many submissions into one kernel wakeup.
 pub const BatchSQ = ring.BatchSQ;
 
-/// A streaming view over the submission queue, opened with `Ring.streamedSQ`.
+/// A streaming view over the submission queue, initialized in place with
+/// `Ring.streamedSQ`.
 ///
 /// It offers the same push surface as `BatchSQ`, but its `commit` re-reads the
 /// ring's cursors so the handle can drive one submission round after another.

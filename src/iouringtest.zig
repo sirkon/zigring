@@ -6,6 +6,7 @@ const BufferSizeClass = @import("iouring.zig").BufferSizeClass;
 const CQE = @import("iouring.zig").CQE;
 const TaskFlags = @import("iouring.zig").TaskFlags;
 const ReorderBuffer = @import("iouring.zig").ReorderBuffer;
+const StreamSQ = @import("iouring.zig").StreamSQ;
 const time = @import("time.zig");
 
 const noOfRequests = 100_000;
@@ -1086,7 +1087,8 @@ test "streamedSQ survives many commit rounds" {
     const fileFd = cqe.res;
     defer _ = linux.close(fileFd);
 
-    var stream = ring.streamedSQ() orelse return error.MissingStream;
+    var stream: StreamSQ = undefined;
+    ring.streamedSQ(&stream);
 
     // More rounds than the ring has entries: if the window did not slide after
     // each commit the stream would wedge once the SQ filled up.

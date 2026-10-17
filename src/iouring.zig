@@ -465,22 +465,20 @@ pub const Ring = struct {
         return .{ .ring = self, .head = head, .tail = tail };
     }
 
-    /// Opens a streaming submission window over the SQ, the long-lived
-    /// counterpart of `batchedSQ`.
+    /// Initializes `target` in place as a streaming submission window over the
+    /// SQ, the long-lived counterpart of `batchedSQ`.
     ///
-    /// It starts from the same head/tail snapshot, but every `commit` rebuilds
-    /// the window from the ring's live cursors, so the same handle keeps
-    /// accepting operations across many submission rounds instead of being a
-    /// one-shot batch. Returns null when the ring is already full at open time.
-    pub inline fn streamedSQ(self: *Self) ?StreamSQ {
-        const tail = self.sqTail.*;
-        const head = @atomicLoad(u32, self.sqHead, .acquire);
-
-        if (tail -% head >= self.sqMask + 1) {
-            return null;
-        }
-
-        return .{ .ring = self, .head = head, .tail = tail };
+    /// It starts from the current head/tail snapshot, but every `commit`
+    /// rebuilds the window from the ring's live cursors, so the same handle
+    /// keeps accepting operations across many submission rounds instead of
+    /// being a one-shot batch. Because the window is rebuilt on `commit`,
+    /// `target` stays usable even if the ring is full at initialization time.
+    pub fn streamedSQ(self: *Self, target: *StreamSQ) void {
+        target.* = .{
+            .ring = self,
+            .head = @atomicLoad(u32, self.sqHead, .acquire),
+            .tail = self.sqTail.*,
+        };
     }
 
     /// Submits a plain file write (`IORING_OP.WRITE`) of `len` bytes from
@@ -1874,7 +1872,8 @@ pub const BatchSQ = struct {
     }
 };
 
-/// A streaming view over the submission queue, created by `Ring.streamedSQ`.
+/// A streaming view over the submission queue, initialized in place by
+/// `Ring.streamedSQ`.
 ///
 /// It mirrors `BatchSQ` (same `push*` surface and single-wakeup `commit`) but
 /// is meant to be kept alive: every `commit` re-reads the ring's live SQ head

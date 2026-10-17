@@ -42,6 +42,7 @@ Re-exported from `src/root.zig` (`file:line` is where the alias lives):
 | `TaskFlags`                                      | packed struct(u8) | Per-SQE flags (`Link`, `Drain`, `SkipSuccess`, ...).      |
 | `BufferSizeClass`                                | enum(u16)         | Size classes for registered / provided buffers.           |
 | `BatchSQ`                                        | struct            | Batched submission window (`Ring.batchedSQ`).             |
+| `StreamSQ`                                       | struct            | Reusable submission window (`Ring.streamedSQ`).           |
 | `BatchCQ`                                        | struct            | Batched completion window (`Ring.batchedCQ`).             |
 | `ReorderBuffer`                                  | struct            | Restores in-order delivery from out-of-order completions. |
 | `Slots(T)`                                       | generic           | Dense `u64` index allocator for trivially copyable `T`.   |
@@ -276,6 +277,23 @@ try batch.commit();
   helpers.
 - `BatchCQ.popCQE()` returns null once the captured tail is reached.
 - `commit` on either batch may return an error from `posix.unexpectedErrno`.
+
+### Streaming submission
+
+`StreamSQ` is the long-lived counterpart of `BatchSQ`. It is initialized **in
+place** (no return value, matching the rest of the API) and its `commit`
+re-reads the ring's live head and tail, so the same handle survives many
+submission rounds instead of being a one-shot window:
+
+```zig
+var stream: zigring.StreamSQ = undefined;
+ring.streamedSQ(&stream);
+while (stream.pushSend(fd, 1, ptr, len, .{}) == null) try stream.commit();
+try stream.commit();
+```
+
+Its push surface and `?void` return convention match `BatchSQ`; every push
+returns null while the window is full, and `commit` slides the window forward.
 
 ### Linked timeout (canonical batch usage)
 
