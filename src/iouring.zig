@@ -44,28 +44,28 @@ pub const TaskFlags = packed struct(u8) {
     const Self = @This();
 
     /// IOSQE_FIXED_FILE (1 << 0): Use pre-registered files (registered fds) instead of regular ones
-    FixedFile: bool = false,
+    fixed_file: bool = false,
 
     /// IOSQE_IODONE_HO_WO (1 << 1): Old internal kernel flag. Not used in user code (can stay false)
     _iosqe_idone_ho_wo: bool = false,
 
     /// IOSQE_IO_DRAIN (1 << 2): Wait for ALL previous tasks in the ring to complete before starting this one
-    Drain: bool = false,
+    drain: bool = false,
 
-    /// IOSQE_IO_LINK (1 << 3): Link this task with the next one. The very flag you need for a timer!
-    Link: bool = false,
+    /// IOSQE_IO_LINK (1 << 3): link this task with the next one. The very flag you need for a timer!
+    link: bool = false,
 
     /// IOSQE_IO_HARDLINK (1 << 4): Like io_link, but the chain doesn't break even if the previous task failed with an error
-    HardLink: bool = false,
+    hard_link: bool = false,
 
     /// IOSQE_ASYNC (1 << 5): Force the task to run asynchronously in kernel workers (io-wq), even if it's non-blocking
-    ForceAsync: bool = false,
+    force_async: bool = false,
 
     /// IOSQE_BUFFER_SELECT (1 << 6): Use automatic buffer selection from the kernel pool (for IORING_OP.PROVIDE_BUFFERS)
-    BufferSelect: bool = false,
+    buffer_select: bool = false,
 
     /// IOSQE_CQE_SKIP_SUCCESS (1 << 7): Don't generate a CQE in the completion queue if the task succeeded
-    SkipSuccess: bool = false,
+    skip_success: bool = false,
 
     pub inline fn flags(self: Self) u8 {
         return @bitCast(self);
@@ -73,7 +73,7 @@ pub const TaskFlags = packed struct(u8) {
 
     pub inline fn expectNext() Self {
         return .{
-            .Link = true,
+            .link = true,
         };
     }
 };
@@ -152,22 +152,22 @@ pub const Ring = struct {
     fd: posix.fd_t,
     flags: u32,
 
-    sqMmapPtr: []align(pageSize) u8,
-    cqMmapPtr: []align(4096) u8, // Using literal page_size alignment
-    sqesMapPtr: []align(pageSize) u8,
+    sq_mmap_ptr: []align(pageSize) u8,
+    cq_mmap_ptr: []align(4096) u8, // Using literal page_size alignment
+    sqes_map_ptr: []align(pageSize) u8,
 
-    sqHead: *u32,
-    sqTail: *u32,
-    sqMask: u32,
-    sqArray: [*]u32,
-    sqEntries: [*]linux.io_uring_sqe,
+    sq_head: *u32,
+    sq_tail: *u32,
+    sq_mask: u32,
+    sq_array: [*]u32,
+    sq_entries: [*]linux.io_uring_sqe,
 
-    cqHead: *u32,
-    cqTail: *u32,
-    cqMask: u32,
-    cqEntries: [*]CQE,
+    cq_head: *u32,
+    cq_tail: *u32,
+    cq_mask: u32,
+    cq_entries: [*]CQE,
 
-    bufPools: [@typeInfo(BufferSizeClass).@"enum".field_names.len]BufferPool =
+    buf_pools: [@typeInfo(BufferSizeClass).@"enum".field_names.len]BufferPool =
         @splat(undefined),
 
     /// Creates a ring in place by calling `io_uring_setup` and mmapping the SQ
@@ -246,26 +246,26 @@ pub const Ring = struct {
         self.* = .{
             .fd = ringFd,
             .flags = params.flags,
-            .sqMmapPtr = sqMmap,
-            .cqMmapPtr = cqMmap,
-            .sqesMapPtr = sqesMmap,
+            .sq_mmap_ptr = sqMmap,
+            .cq_mmap_ptr = cqMmap,
+            .sqes_map_ptr = sqesMmap,
 
-            .sqHead = @ptrCast(@alignCast(sqBase + params.sq_off.head)),
-            .sqTail = @ptrCast(@alignCast(sqBase + params.sq_off.tail)),
-            .sqMask = sqMaskPtr.*,
-            .sqArray = @ptrCast(@alignCast(sqBase + params.sq_off.array)),
-            .sqEntries = @ptrCast(@alignCast(sqesMmap.ptr)),
+            .sq_head = @ptrCast(@alignCast(sqBase + params.sq_off.head)),
+            .sq_tail = @ptrCast(@alignCast(sqBase + params.sq_off.tail)),
+            .sq_mask = sqMaskPtr.*,
+            .sq_array = @ptrCast(@alignCast(sqBase + params.sq_off.array)),
+            .sq_entries = @ptrCast(@alignCast(sqesMmap.ptr)),
 
-            .cqHead = @ptrCast(@alignCast(cqBase + params.cq_off.head)),
-            .cqTail = @ptrCast(@alignCast(cqBase + params.cq_off.tail)),
-            .cqMask = cqMaskPtr.*,
-            .cqEntries = @ptrCast(@alignCast(cqBase + params.cq_off.cqes)),
-            .bufPools = undefined,
+            .cq_head = @ptrCast(@alignCast(cqBase + params.cq_off.head)),
+            .cq_tail = @ptrCast(@alignCast(cqBase + params.cq_off.tail)),
+            .cq_mask = cqMaskPtr.*,
+            .cq_entries = @ptrCast(@alignCast(cqBase + params.cq_off.cqes)),
+            .buf_pools = undefined,
         };
 
         // No size class has a pool yet; marking them uninitialized keeps
         // `deinit` and the buffer-select ops from touching garbage state.
-        for (&self.bufPools) |*pool| {
+        for (&self.buf_pools) |*pool| {
             pool.initUninitialized();
         }
     }
@@ -278,11 +278,11 @@ pub const Ring = struct {
     /// free the memory returned by `registerBuffers`: that mapping is owned by
     /// the caller and must be released with `posix.munmap`.
     pub fn deinit(self: *Self) void {
-        posix.munmap(self.sqMmapPtr);
-        posix.munmap(self.sqesMapPtr);
-        posix.munmap(self.cqMmapPtr);
+        posix.munmap(self.sq_mmap_ptr);
+        posix.munmap(self.sqes_map_ptr);
+        posix.munmap(self.cq_mmap_ptr);
         _ = linux.close(self.fd);
-        for (&self.bufPools) |*pool| {
+        for (&self.buf_pools) |*pool| {
             pool.deinit();
         }
     }
@@ -300,7 +300,7 @@ pub const Ring = struct {
     /// class and is owned and freed by the ring itself, not by the caller.
     pub fn regiterSizeClassReceiveBuffer(self: *Self, sizeClass: BufferSizeClass, entries: u32) !void {
         const idx = @backingInt(sizeClass);
-        const bufPool = &self.bufPools[idx];
+        const bufPool = &self.buf_pools[idx];
         if (!bufPool.isInactive()) {
             return error.BufferOfSizeAlreadyInitialized;
         }
@@ -402,15 +402,15 @@ pub const Ring = struct {
 
     // try to retrieve a room for a new op.
     inline fn getOpSlot(self: *Self) !struct { idx: u32, entry: *linux.io_uring_sqe, head: u32 } {
-        const tail = self.sqTail.*;
-        const head = @atomicLoad(u32, self.sqHead, .acquire);
+        const tail = self.sq_tail.*;
+        const head = @atomicLoad(u32, self.sq_head, .acquire);
 
-        if (tail - head >= self.sqMask + 1) {
+        if (tail - head >= self.sq_mask + 1) {
             return error.RingFull;
         }
 
-        const sqeIdx = tail & self.sqMask;
-        const sqe = &self.sqEntries[sqeIdx];
+        const sqeIdx = tail & self.sq_mask;
+        const sqe = &self.sq_entries[sqeIdx];
 
         @memset(std.mem.asBytes(sqe), 0);
 
@@ -419,18 +419,18 @@ pub const Ring = struct {
 
     // push a task.
     fn commitOp(self: *Self, idx: u32, cachedHead: u32) !void {
-        self.sqArray[idx] = idx;
+        self.sq_array[idx] = idx;
 
-        const currentTail = self.sqTail.*;
+        const currentTail = self.sq_tail.*;
         const nextTail = currentTail + 1;
 
-        @atomicStore(u32, self.sqTail, nextTail, .release);
+        @atomicStore(u32, self.sq_tail, nextTail, .release);
 
         if (currentTail != cachedHead) {
             return;
         }
 
-        const freshHead = @atomicLoad(u32, self.sqHead, .acquire);
+        const freshHead = @atomicLoad(u32, self.sq_head, .acquire);
         if (currentTail != freshHead) {
             return;
         }
@@ -455,10 +455,10 @@ pub const Ring = struct {
     /// publishing them, so many operations can be flushed with a single
     /// `io_uring_enter`. Returns null when the ring is already full.
     pub inline fn batchedSQ(self: *Self) ?BatchSQ {
-        const tail = self.sqTail.*;
-        const head = @atomicLoad(u32, self.sqHead, .acquire);
+        const tail = self.sq_tail.*;
+        const head = @atomicLoad(u32, self.sq_head, .acquire);
 
-        if (tail -% head >= self.sqMask + 1) {
+        if (tail -% head >= self.sq_mask + 1) {
             return null;
         }
 
@@ -476,8 +476,8 @@ pub const Ring = struct {
     pub fn streamedSQ(self: *Self, target: *StreamSQ) void {
         target.* = .{
             .ring = self,
-            .head = @atomicLoad(u32, self.sqHead, .acquire),
-            .tail = self.sqTail.*,
+            .head = @atomicLoad(u32, self.sq_head, .acquire),
+            .tail = self.sq_tail.*,
         };
     }
 
@@ -663,7 +663,7 @@ pub const Ring = struct {
         flags: TaskFlags,
     ) !void {
         const bgid = @backingInt(size);
-        if (self.bufPools[bgid].isInactive()) {
+        if (self.buf_pools[bgid].isInactive()) {
             @branchHint(.cold);
             return error.BufferPoolNotInitialized;
         }
@@ -785,7 +785,7 @@ pub const Ring = struct {
         flags: TaskFlags,
     ) !void {
         const bgid = @backingInt(size);
-        if (self.bufPools[bgid].isInactive()) {
+        if (self.buf_pools[bgid].isInactive()) {
             @branchHint(.cold);
             return error.BufferPoolNotInitialized;
         }
@@ -846,7 +846,7 @@ pub const Ring = struct {
         flags: TaskFlags,
     ) !void {
         const bgid = @backingInt(size);
-        if (self.bufPools[bgid].isInactive()) {
+        if (self.buf_pools[bgid].isInactive()) {
             @branchHint(.cold);
             return error.BufferPoolNotInitialized;
         }
@@ -1259,7 +1259,7 @@ pub const Ring = struct {
     /// The target ring receives a `CQE` whose `res` is `msgResult` and whose
     /// `taskIdx` is this call's `taskIdx`, so the receiver can tell senders
     /// apart. The operation is non-blocking and no completion is generated on
-    /// the sending ring (`SkipSuccess`), so nothing needs to be awaited here.
+    /// the sending ring (`skip_success`), so nothing needs to be awaited here.
     pub inline fn pushMsgRingFd(
         self: *Self,
         targetRingFd: posix.fd_t, // fd of the ring belonging to the sleeping thread
@@ -1293,7 +1293,7 @@ pub const Ring = struct {
     /// ring's own descriptor. The target ring receives a `CQE` whose `res` is
     /// `msgResult` and whose `taskIdx` is this call's `taskIdx`. The operation
     /// is non-blocking and no completion is generated on the sending ring
-    /// (`SkipSuccess`), so nothing needs to be awaited here.
+    /// (`skip_success`), so nothing needs to be awaited here.
     pub inline fn pushMsgRing(
         self: *Self,
         targetRing: *Ring, // ring belonging to the sleeping thread
@@ -1314,7 +1314,7 @@ pub const Ring = struct {
     ///
     /// `timespecPtr` is read by the kernel while the timer runs, so it must
     /// remain valid and unchanged until the completion is consumed. Take care
-    /// with `SkipSuccess`: suppressing the completion also hides the only
+    /// with `skip_success`: suppressing the completion also hides the only
     /// signal that the pointer is no longer needed, leaking it unless the
     /// timespec is static.
     pub inline fn pushTimeout(
@@ -1365,7 +1365,7 @@ pub const Ring = struct {
     /// `quantizationPtr` is read by the kernel while the ticker runs, so it
     /// must remain valid and unchanged until the ticker's last completion is
     /// consumed. Use `pushCancel` to stop an unlimited ticker early. Take care
-    /// with `SkipSuccess`: suppressing completions also hides the only signal
+    /// with `skip_success`: suppressing completions also hides the only signal
     /// that the pointer is no longer needed.
     pub inline fn pushTicker(
         self: *Self,
@@ -1413,7 +1413,7 @@ pub const Ring = struct {
     /// counts exactly one operation.
     ///
     /// `timespecPtr` must remain valid and unchanged until the completion is
-    /// consumed. As with `pushTimeout`, be careful with `SkipSuccess`: hiding
+    /// consumed. As with `pushTimeout`, be careful with `skip_success`: hiding
     /// the completion keeps the pointer live until it is known to be freeable.
     pub inline fn pushTimeoutForOp(
         self: *Self,
@@ -1492,17 +1492,17 @@ pub const Ring = struct {
     /// completions unread will eventually stall the CQ. Call this on the hot
     /// path and fall back to `park` only when it returns null.
     pub inline fn popCQE(self: *Self) ?CQE {
-        const head = self.cqHead.*;
-        const tail = @atomicLoad(u32, self.cqTail, .acquire);
+        const head = self.cq_head.*;
+        const tail = @atomicLoad(u32, self.cq_tail, .acquire);
 
         if (head == tail) return null;
 
-        const cqeIdx = head & self.cqMask;
+        const cqeIdx = head & self.cq_mask;
 
         // Advance the ring head one at a time with .release semantics
-        @atomicStore(u32, self.cqHead, head +% 1, .release);
+        @atomicStore(u32, self.cq_head, head +% 1, .release);
 
-        return self.cqEntries[cqeIdx];
+        return self.cq_entries[cqeIdx];
     }
 
     /// Returns true when at least one completion is waiting in the CQ, false
@@ -1511,8 +1511,8 @@ pub const Ring = struct {
     /// same acquire load of the CQ tail as `popCQE`, so a true result guarantees
     /// a following `popCQE`/`batchedCQ` sees at least one completion.
     pub inline fn checkCQNotEmpty(self: *Self) bool {
-        const head = self.cqHead.*;
-        const tail = @atomicLoad(u32, self.cqTail, .acquire);
+        const head = self.cq_head.*;
+        const tail = @atomicLoad(u32, self.cq_tail, .acquire);
 
         return head != tail;
     }
@@ -1528,8 +1528,8 @@ pub const Ring = struct {
     /// single batch can be kept bounded. Pass `null` to drain everything
     /// currently visible.
     pub inline fn batchedCQ(self: *Self, maxEntries: ?u32) ?BatchCQ {
-        const head = self.cqHead.*;
-        const tail = @atomicLoad(u32, self.cqTail, .acquire);
+        const head = self.cq_head.*;
+        const tail = @atomicLoad(u32, self.cq_tail, .acquire);
 
         if (head == tail) {
             return null;
@@ -1599,7 +1599,7 @@ pub const Ring = struct {
     /// automatically. Out-of-range ids, or a pool that is not initialized, are
     /// ignored.
     pub fn releaseBuffer(self: *Self, sizeClass: BufferSizeClass, bid: u16) void {
-        self.bufPools[sizeClass.bgid()].releaseBuffer(bid);
+        self.buf_pools[sizeClass.bgid()].releaseBuffer(bid);
     }
 
     /// Returns the bytes of provided buffer `bid` from the pool for
@@ -1611,7 +1611,7 @@ pub const Ring = struct {
     /// generally, until the ring is deinitialized). Do not free it. For a given
     /// completion only the first `CQE.result()` bytes hold data.
     pub fn buffer(self: *Self, sizeClass: BufferSizeClass, bid: u16) ?[]const u8 {
-        var bufpool: BufferPool = self.bufPools[sizeClass.bgid()];
+        var bufpool: BufferPool = self.buf_pools[sizeClass.bgid()];
         return bufpool.buffer(bid) catch {
             return null;
         };
@@ -1642,15 +1642,15 @@ pub const BatchSQ = struct {
     inline fn reserve(self: *Self) ?*linux.io_uring_sqe {
         const ring = self.ring;
 
-        if (self.tail -% self.head >= ring.sqMask + 1) {
+        if (self.tail -% self.head >= ring.sq_mask + 1) {
             return null;
         }
 
-        const idx = self.tail & ring.sqMask;
-        const sqe = &ring.sqEntries[idx];
+        const idx = self.tail & ring.sq_mask;
+        const sqe = &ring.sq_entries[idx];
 
         @memset(std.mem.asBytes(sqe), 0);
-        ring.sqArray[idx] = idx;
+        ring.sq_array[idx] = idx;
 
         self.tail +%= 1;
 
@@ -1852,7 +1852,7 @@ pub const BatchSQ = struct {
     pub fn commit(self: *Self) !void {
         const ring = self.ring;
 
-        @atomicStore(u32, ring.sqTail, self.tail, .release);
+        @atomicStore(u32, ring.sq_tail, self.tail, .release);
 
         var sig: linux.sigset_t = undefined;
         const res = linux.io_uring_enter(
@@ -1898,15 +1898,15 @@ pub const StreamSQ = struct {
     inline fn reserve(self: *Self) ?*linux.io_uring_sqe {
         const ring = self.ring;
 
-        if (self.tail -% self.head >= ring.sqMask + 1) {
+        if (self.tail -% self.head >= ring.sq_mask + 1) {
             return null;
         }
 
-        const idx = self.tail & ring.sqMask;
-        const sqe = &ring.sqEntries[idx];
+        const idx = self.tail & ring.sq_mask;
+        const sqe = &ring.sq_entries[idx];
 
         @memset(std.mem.asBytes(sqe), 0);
-        ring.sqArray[idx] = idx;
+        ring.sq_array[idx] = idx;
 
         self.tail +%= 1;
 
@@ -2110,7 +2110,7 @@ pub const StreamSQ = struct {
     pub fn commit(self: *Self) !void {
         const ring = self.ring;
 
-        @atomicStore(u32, ring.sqTail, self.tail, .release);
+        @atomicStore(u32, ring.sq_tail, self.tail, .release);
 
         var sig: linux.sigset_t = undefined;
         const res = linux.io_uring_enter(
@@ -2126,8 +2126,8 @@ pub const StreamSQ = struct {
             return posix.unexpectedErrno(err);
         }
 
-        self.head = @atomicLoad(u32, ring.sqHead, .acquire);
-        self.tail = ring.sqTail.*;
+        self.head = @atomicLoad(u32, ring.sq_head, .acquire);
+        self.tail = ring.sq_tail.*;
     }
 };
 
@@ -2159,12 +2159,12 @@ pub const BatchCQ = struct {
         }
 
         const ring = self.ring;
-        const cqeIdx = self.head & ring.cqMask;
+        const cqeIdx = self.head & ring.cq_mask;
 
         // Advance the batch cursor only; the ring head stays put until commit.
         self.head +%= 1;
 
-        return ring.cqEntries[cqeIdx];
+        return ring.cq_entries[cqeIdx];
     }
 
     /// Publishes every popped completion by atomically moving the ring's
@@ -2173,7 +2173,7 @@ pub const BatchCQ = struct {
     pub fn commit(self: *Self) !void {
         const ring = self.ring;
 
-        @atomicStore(u32, ring.cqHead, self.head, .release);
+        @atomicStore(u32, ring.cq_head, self.head, .release);
 
         var sig: linux.sigset_t = undefined;
         const res = linux.io_uring_enter(
@@ -2198,20 +2198,20 @@ pub const ReorderBuffer = struct {
 
     allocator: std.mem.Allocator,
 
-    buf: []u8, // data: mod * itemSize
+    buf: []u8, // data: mod * item_size
     nexts: []i32, // nexts[i] = next node in the list
     prevs: []i32, // prevs[i] = previous node in the list
 
     size: u64, // window N
     mod: u64, // 2N
-    itemSize: usize,
+    item_size: usize,
 
     wave: u64, // expected seqIdx
     first: i32, // head of the list
     last: i32, // tail of the list
 
     /// Creates in place a reorder buffer that holds up to `size` in-flight items
-    /// of `itemSize` bytes each.
+    /// of `item_size` bytes each.
     ///
     /// `size` is the reorder window: an item may arrive at most `size - 1`
     /// positions ahead of the next expected sequence index, otherwise `push`
@@ -2222,7 +2222,7 @@ pub const ReorderBuffer = struct {
     ///
     /// `self` must point at storage that outlives the buffer; on success it
     /// must be released with `deinit`. On failure `self` is left untouched.
-    pub fn init(self: *Self, allocator: std.mem.Allocator, size: usize, itemSize: usize) !void {
+    pub fn init(self: *Self, allocator: std.mem.Allocator, size: usize, item_size: usize) !void {
         if (@popCount(size) != 1) {
             return error.ReorderBufferSizeMustBeAPowOf2;
         }
@@ -2231,7 +2231,7 @@ pub const ReorderBuffer = struct {
         }
 
         const mod = 2 * size;
-        const buf = try allocator.alloc(u8, mod * itemSize);
+        const buf = try allocator.alloc(u8, mod * item_size);
         errdefer allocator.free(buf);
 
         const nexts = try allocator.alloc(i32, mod);
@@ -2250,7 +2250,7 @@ pub const ReorderBuffer = struct {
             .prevs = prevs,
             .size = size,
             .mod = mod,
-            .itemSize = itemSize,
+            .item_size = item_size,
             .wave = 0,
             .first = -1,
             .last = -1,
@@ -2271,7 +2271,7 @@ pub const ReorderBuffer = struct {
     /// Inserts the item in `data`, tagged with the absolute sequence index
     /// `idx`, into the buffer while keeping pending items ordered by index.
     ///
-    /// `data.len` must equal the `itemSize` given to `init`. An index below the
+    /// `data.len` must equal the `item_size` given to `init`. An index below the
     /// current wave is rejected with `error.OutdatedFrame`, and one `size` or
     /// more ahead with `error.FramesAreTooFarAway`. The bytes are copied in, so
     /// `data` remains owned by the caller.
@@ -2299,8 +2299,8 @@ pub const ReorderBuffer = struct {
         const relIdx: i32 = @intCast(idx & (self.mod - 1));
 
         // Write the data
-        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.itemSize;
-        @memcpy(self.buf[offset .. offset + self.itemSize], data);
+        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.item_size;
+        @memcpy(self.buf[offset .. offset + self.item_size], data);
 
         // First element in the list
         if (self.last < 0) {
@@ -2404,8 +2404,8 @@ pub const ReorderBuffer = struct {
             return null;
         }
 
-        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.itemSize;
-        const res = self.buf[offset .. offset + self.itemSize];
+        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.item_size;
+        const res = self.buf[offset .. offset + self.item_size];
 
         const second = self.nexts[@bitCast(@as(i64, relIdx))];
         if (second < 0) {
@@ -2429,8 +2429,8 @@ pub const ReorderBuffer = struct {
             return null;
         }
 
-        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.itemSize;
-        return self.buf[offset .. offset + self.itemSize];
+        const offset = @as(usize, @intCast(idx & (self.mod - 1))) * self.item_size;
+        return self.buf[offset .. offset + self.item_size];
     }
 
     /// Removes the current head item without returning it, advancing the head

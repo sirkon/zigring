@@ -41,7 +41,7 @@ zig fmt src/ build.zig  # formatting (source is already fmt-clean)
 | `src/root.zig` | Public entry point. Re-exports every type/value consumers need and pulls each private module's `test` blocks in via `_ = module;`. Add new public API here or it is unreachable. |
 | `src/iouring.zig` | The core (~1800 lines). `Ring`, `CQE`, `TaskFlags`, `BufferSizeClass`, `BatchSQ`, `StreamSQ`, `BatchCQ`, `ReorderBuffer`. |
 | `src/provided_buffer.zig` | `ProvidedBufferPool`: kernel-provided buffer rings (huge-page mmap, `IORING_REGISTER_PBUF_RING`). |
-| `src/ring_factory.zig` | `Factory`: thread-safe ring allocator that spreads rings over at most `maxPollerThreads` kernel pollers using `IORING_SETUP_ATTACH_WQ`. (Renamed from `ring_manager.zig`.) |
+| `src/ring_factory.zig` | `Factory`: thread-safe ring allocator that spreads rings over at most `max_poller_threads` kernel pollers using `IORING_SETUP_ATTACH_WQ`. (Renamed from `ring_manager.zig`.) |
 | `src/slotter.zig` | `Slots(T)` and `BufferSlots`: dense index allocators with lazy child tables. |
 | `src/pthread.zig` | Hand-declared `extern "c"` pthread mutex/cond/thread wrappers. |
 | `src/time.zig` | vDSO `clock_gettime` helpers (`nowNs`, `monotonicNs`). |
@@ -69,7 +69,7 @@ The integration tests model application logic as explicit FSMs (`echoServerFSM`,
   (`undefined`, or a stable local/field) and pass its address. `Mutex`/`CondVar`
   have no value-returning form at all.
 - **Do not "fix" the public API spelling/typos.** `regiterSizeClassReceiveBuffer`
-  (missing `s`) and `ProvidedBufferPool.notInitalized` are load-bearing public
+  (missing `s`) and `ProvidedBufferPool.not_initalized` are load-bearing public
   names. Renaming them breaks downstream code; only change names the user asks for.
 
 ## Gotchas (read before touching `iouring.zig`)
@@ -112,7 +112,7 @@ The integration tests model application logic as explicit FSMs (`echoServerFSM`,
   `IORING_REGISTER` enum ordering is not stable across kernels.
 - `ring_factory.acquireRing(ring, queueDepth, weight)` uses weight to pick the
   poller with the least load and refuses to build a new poller past
-  `maxPollerThreads`. It initializes the ring in place at the given pointer.
+  `max_poller_threads`. It initializes the ring in place at the given pointer.
 
 ## Testing patterns
 

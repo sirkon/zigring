@@ -8,7 +8,7 @@ pub const Factory = struct {
     const Self = @This();
 
     // Maximal amount of poller threads available.
-    maxPollerThreads: u32,
+    max_poller_threads: u32,
     allocator: std.mem.Allocator,
 
     mutex: pthread.Mutex,
@@ -18,11 +18,11 @@ pub const Factory = struct {
 
     // Represents a kernel poller.
     const PollerGroup = struct {
-        masterFd: posix.fd_t,
+        master_fd: posix.fd_t,
         // Weight of rings of the current poller.
-        currentWeight: u32,
+        current_weight: u32,
         // Amount of rings of this poller.
-        ringCount: u32,
+        ring_count: u32,
     };
 
     /// Initializes the factory in place.
@@ -30,9 +30,9 @@ pub const Factory = struct {
     /// The factory embeds a `pthread.Mutex`, which pthreads forbids copying
     /// once initialized, so it is initialized at its final address rather than
     /// returned by value.
-    pub fn init(self: *Self, allocator: std.mem.Allocator, maxPollerThreads: u32) !void {
-        const groups = try std.ArrayList(PollerGroup).initCapacity(allocator, maxPollerThreads);
-        self.maxPollerThreads = maxPollerThreads;
+    pub fn init(self: *Self, allocator: std.mem.Allocator, max_poller_threads: u32) !void {
+        const groups = try std.ArrayList(PollerGroup).initCapacity(allocator, max_poller_threads);
+        self.max_poller_threads = max_poller_threads;
         self.allocator = allocator;
         self.groups = groups;
         self.mutex.init();
@@ -58,8 +58,8 @@ pub const Factory = struct {
 
         // Step 1. Look for the poller with the minimal weight.
         for (self.groups.items, 0..) |group, i| {
-            if (group.currentWeight < minWeightFound) {
-                minWeightFound = group.currentWeight;
+            if (group.current_weight < minWeightFound) {
+                minWeightFound = group.current_weight;
                 bestGroupIdx = i;
             }
         }
@@ -67,18 +67,18 @@ pub const Factory = struct {
         // Step 2. Decide, whether to create a new poller thread or reuse one.
         // We create if:
         // 1. We haven't created anything yet.
-        // 2. We haven't reached the maxPollerThreads.
+        // 2. We haven't reached the max_poller_threads.
         if (self.groups.items.len == 0 or
-            (self.groups.items.len < self.maxPollerThreads and minWeightFound > 0))
+            (self.groups.items.len < self.max_poller_threads and minWeightFound > 0))
         {
             // Create a new master thread.
             try ring.init(queueDepth, null);
 
             // Register new group of rings for the master thread.
             self.groups.append(self.allocator, .{
-                .masterFd = ring.fd,
-                .currentWeight = weight,
-                .ringCount = 1,
+                .master_fd = ring.fd,
+                .current_weight = weight,
+                .ring_count = 1,
             }) catch |err| {
                 ring.deinit();
                 return err;
@@ -91,10 +91,10 @@ pub const Factory = struct {
         // and we must attach a new ring to the existing kernel thread.
         const targetGroup = &self.groups.items[bestGroupIdx.?];
 
-        try ring.init(queueDepth, targetGroup.masterFd);
+        try ring.init(queueDepth, targetGroup.master_fd);
 
         // Update group metrics.
-        targetGroup.currentWeight += weight;
-        targetGroup.ringCount += 1;
+        targetGroup.current_weight += weight;
+        targetGroup.ring_count += 1;
     }
 };

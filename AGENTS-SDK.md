@@ -39,7 +39,7 @@ Re-exported from `src/root.zig` (`file:line` is where the alias lives):
 | `Ring`                                           | struct            | The io_uring itself: submit, complete, park.              |
 | `Factory`                                        | struct            | Thread-safe ring allocator over bounded kernel pollers.   |
 | `CQE`                                            | extern struct     | A completion; byte-for-byte layout of `io_uring_cqe`.     |
-| `TaskFlags`                                      | packed struct(u8) | Per-SQE flags (`Link`, `Drain`, `SkipSuccess`, ...).      |
+| `TaskFlags`                                      | packed struct(u8) | Per-SQE flags (`link`, `drain`, `skip_success`, ...).      |
 | `BufferSizeClass`                                | enum(u16)         | Size classes for registered / provided buffers.           |
 | `BatchSQ`                                        | struct            | Batched submission window (`Ring.batchedSQ`).             |
 | `StreamSQ`                                       | struct            | Reusable submission window (`Ring.streamedSQ`).           |
@@ -160,7 +160,7 @@ Gotchas:
   Push both in the *same* `batchedSQ` batch, otherwise the kernel rejects the
   SQE with `-EINVAL`. See "Linked timeout" below.
 - **`pushMsgRing`/`pushMsgRingFd`** never produce a local completion
-  (`SkipSuccess`); the target ring sees a CQE whose `res` is `msgResult` and
+  (`skip_success`); the target ring sees a CQE whose `res` is `msgResult` and
   whose `taskIdx` is this call's `taskIdx`.
 - Some operations are offloaded to io-wq internally (`pushOpenDir`,
   `pushOpenFile`, `pushClose`, `pushRename` use `IOSQE_ASYNC`), which keeps
@@ -308,20 +308,20 @@ _ = batch.pushTimeoutForOp(&spec, 3, .{});
 try batch.commit();
 ```
 
-`TaskFlags.expectNext()` sets `Link` on the guarded op. On expiry the accept's
+`TaskFlags.expectNext()` sets `link` on the guarded op. On expiry the accept's
 CQE reports `-ECANCELED` and the timeout CQE reports success (`res == 0`).
 
 ## `Factory`: threads and pollers
 
 ```zig
-pub fn init(self: *Self, allocator: std.mem.Allocator, maxPollerThreads: u32) !void;
+pub fn init(self: *Self, allocator: std.mem.Allocator, max_poller_threads: u32) !void;
 pub fn deinit(self: *Self) void;
 pub fn acquireRing(self: *Self, ring: *Ring, queueDepth: u32, weight: u32) !void;
 ```
 
 Thread-safe. `acquireRing` picks the poller with the least accumulated `weight`
 and attaches a new ring to it (`IORING_SETUP_ATTACH_WQ`); it starts a new poller
-only while fewer than `maxPollerThreads` exist and the best one still has load.
+only while fewer than `max_poller_threads` exist and the best one still has load.
 `weight` is your estimate of how much work the ring will do. The factory owns no
 rings; the caller owns the storage passed to `acquireRing` and deinits each
 `Ring`. The **master ring** (the first one in a group) must outlive every ring
@@ -346,22 +346,22 @@ defer ring.deinit();
 
 ```zig
 pub const TaskFlags = packed struct(u8) {
-    FixedFile: bool = false,
-    Drain: bool = false,
-    Link: bool = false,
-    HardLink: bool = false,
-    ForceAsync: bool = false,
-    BufferSelect: bool = false,
-    SkipSuccess: bool = false,
+    fixed_file: bool = false,
+    drain: bool = false,
+    link: bool = false,
+    hard_link: bool = false,
+    force_async: bool = false,
+    buffer_select: bool = false,
+    skip_success: bool = false,
     pub inline fn flags(self: TaskFlags) u8;
-    pub inline fn expectNext() TaskFlags; // { .Link = true }
+    pub inline fn expectNext() TaskFlags; // { .link = true }
 };
 ```
 
-Pass `.{}` for defaults. `SkipSuccess` suppresses the completion on success;
+Pass `.{}` for defaults. `skip_success` suppresses the completion on success;
 use with care for operations whose buffer/pointer you must reclaim (e.g.
 timeouts), since it also hides the signal that the pointer is no longer needed.
-`BufferSelect` is set automatically by the `*ZC` buffer-select ops.
+`buffer_select` is set automatically by the `*ZC` buffer-select ops.
 
 ## Timers
 
@@ -449,7 +449,7 @@ const j = try bufs.alloc(); // index only
 ```
 
 - `capacity` must be a power of two and at least 4096 (`error.CapacityMustBePowerOfTwo`, `error.CapacityTooSmall`);
-  `elementSize`
+  `element_size`
   must be non-zero (`error.ElementSizeCannotBeZero`). Full tables return
   `error.NoFreeSlots`.
 - `Slots(T)`: values are stored **by copy**, no destructor ever runs, so `T`

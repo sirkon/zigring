@@ -54,12 +54,12 @@ const echoServerFSM = struct {
     ring: *Ring,
     slots: *slotter.BufferSlots,
     placeholder: []u8,
-    bufRest: []u8,
+    buf_rest: []u8,
     critical: []u8,
     ordbuf: *ReorderBuffer,
 
-    reqCount: u64,
-    respCount: u64,
+    req_count: u64,
+    resp_count: u64,
     state: enum {
         // We need to receive data.
         needRecv,
@@ -71,15 +71,15 @@ const echoServerFSM = struct {
     },
     limit: u64,
 
-    clientFd: posix.fd_t,
-    recvArmed: bool,
+    client_fd: posix.fd_t,
+    recv_armed: bool,
 
     fn init(
         self: *Self,
         allocator: std.mem.Allocator,
         ring: *Ring,
         slots: *slotter.BufferSlots,
-        clientFd: posix.fd_t,
+        client_fd: posix.fd_t,
         ordbuf: *ReorderBuffer,
         limit: u64,
     ) !void {
@@ -88,15 +88,15 @@ const echoServerFSM = struct {
             .ring = ring,
             .slots = slots,
             .placeholder = try allocator.alloc(u8, 1024),
-            .bufRest = &[0]u8{},
+            .buf_rest = &[0]u8{},
             .critical = "",
             .ordbuf = ordbuf,
-            .reqCount = 0,
-            .respCount = 0,
+            .req_count = 0,
+            .resp_count = 0,
             .state = .needRecv,
             .limit = limit,
-            .clientFd = clientFd,
-            .recvArmed = false,
+            .client_fd = client_fd,
+            .recv_armed = false,
         };
     }
 
@@ -108,14 +108,14 @@ const echoServerFSM = struct {
     }
 
     fn do(self: *Self) !bool {
-        if (self.reqCount == self.limit and self.state == .needRecv) {
+        if (self.req_count == self.limit and self.state == .needRecv) {
             self.state = .needCheck;
         }
 
         switch (self.state) {
             .needRecv => {
-                if (!self.recvArmed) {
-                    self.ring.pushRecvZC(self.clientFd, recvIdx, .tiny, .{}) catch |err| {
+                if (!self.recv_armed) {
+                    self.ring.pushRecvZC(self.client_fd, recvIdx, .tiny, .{}) catch |err| {
                         if (err != error.RingFull) {
                             try self.setCritical("critical push error", .{});
                             return err;
@@ -123,7 +123,7 @@ const echoServerFSM = struct {
                         self.state = .needCheck;
                         return false;
                     };
-                    self.recvArmed = true;
+                    self.recv_armed = true;
                 }
 
                 self.state = .needCheck;
@@ -131,7 +131,7 @@ const echoServerFSM = struct {
             },
 
             .needReply => {
-                const chunk = self.ordbuf.peekHeadCond(self.reqCount) orelse {
+                const chunk = self.ordbuf.peekHeadCond(self.req_count) orelse {
                     self.state = .needRecv;
                     return false;
                 };
@@ -158,8 +158,8 @@ const echoServerFSM = struct {
                     return error.ReplyErrorMissingBuffer;
                 };
 
-                echoPayload.save(buffer, self.reqCount, "World", now);
-                self.ring.pushSend(self.clientFd, bufferIdx, buffer[0..21], 21, .{}) catch |err| {
+                echoPayload.save(buffer, self.req_count, "World", now);
+                self.ring.pushSend(self.client_fd, bufferIdx, buffer[0..21], 21, .{}) catch |err| {
                     if (err == error.RingFull) {
                         self.slots.del(bufferIdx);
                         std.atomic.spinLoopHint();
@@ -171,19 +171,19 @@ const echoServerFSM = struct {
                 };
 
                 self.ordbuf.dropHead();
-                self.reqCount += 1;
+                self.req_count += 1;
                 self.state = .needCheck;
                 return true;
             },
 
             .needCheck => {
-                if (self.bufRest.len >= 21) {
-                    const seqIdx = echoPayload.getSeqIdx(self.bufRest[0..21]);
-                    self.ordbuf.push(seqIdx, self.bufRest[0..21]) catch |err| {
+                if (self.buf_rest.len >= 21) {
+                    const seqIdx = echoPayload.getSeqIdx(self.buf_rest[0..21]);
+                    self.ordbuf.push(seqIdx, self.buf_rest[0..21]) catch |err| {
                         std.debug.panic("push data into the reorder buffer (wave={}, idx={}): {any}", .{ self.ordbuf.wave, seqIdx, err });
                     };
                     self.state = .needReply;
-                    self.bufRest = self.bufRest[21..];
+                    self.buf_rest = self.buf_rest[21..];
                     return true;
                 }
 
@@ -199,7 +199,7 @@ const echoServerFSM = struct {
 
                 if (cqe.taskIdx() != recvIdx) {
                     // This is a notification about reply.
-                    self.respCount += 1;
+                    self.resp_count += 1;
                     self.state = .needRecv;
                     self.slots.del(cqe.taskIdx());
                     return true;
@@ -211,15 +211,15 @@ const echoServerFSM = struct {
                     return error.CQEBidError;
                 };
 
-                if (self.bufRest.len > 0) {
-                    std.mem.copyForwards(u8, self.placeholder[0..self.bufRest.len], self.bufRest);
+                if (self.buf_rest.len > 0) {
+                    std.mem.copyForwards(u8, self.placeholder[0..self.buf_rest.len], self.buf_rest);
                 }
 
-                @memcpy(self.placeholder[self.bufRest.len .. self.bufRest.len + cqe.result()], buffer[0..cqe.result()]);
-                self.bufRest = self.placeholder[0 .. self.bufRest.len + cqe.result()];
+                @memcpy(self.placeholder[self.buf_rest.len .. self.buf_rest.len + cqe.result()], buffer[0..cqe.result()]);
+                self.buf_rest = self.placeholder[0 .. self.buf_rest.len + cqe.result()];
                 self.ring.releaseBuffer(.tiny, cqe.bid());
 
-                self.recvArmed = false;
+                self.recv_armed = false;
                 self.state = .needRecv;
                 return true;
             },
@@ -234,7 +234,7 @@ const echoServerFSM = struct {
             \\   state: {}
             \\ ---
             \\
-        , .{ self.reqCount, self.respCount, self.state });
+        , .{ self.req_count, self.resp_count, self.state });
         self.critical = try std.fmt.allocPrint(self.allocator, format, args);
     }
 
@@ -243,11 +243,11 @@ const echoServerFSM = struct {
     }
 
     pub fn done(self: *Self) bool {
-        return self.reqCount >= self.limit and self.respCount >= self.limit;
+        return self.req_count >= self.limit and self.resp_count >= self.limit;
     }
 
     inline fn reqBody(self: *Self) []u8 {
-        return self.bufRest[0..21];
+        return self.buf_rest[0..21];
     }
 };
 
@@ -260,12 +260,12 @@ const echoClientFSM = struct {
     ring: *Ring,
     slots: *slotter.BufferSlots,
     placeholder: []u8,
-    bufRest: []u8,
+    buf_rest: []u8,
     critical: []u8,
     reply: [21]u8,
 
-    reqCount: u64,
-    respCount: u64,
+    req_count: u64,
+    resp_count: u64,
     state: enum {
         needSend,
         needCheck,
@@ -273,17 +273,17 @@ const echoClientFSM = struct {
     },
     limit: u64,
 
-    serverFd: posix.fd_t,
-    iterationCounter: usize = 0,
-    lastRespCount: u64 = 0,
-    recvArmed: bool = false,
+    server_fd: posix.fd_t,
+    iteration_counter: usize = 0,
+    last_resp_count: u64 = 0,
+    recv_armed: bool = false,
 
     fn init(
         self: *Self,
         allocator: std.mem.Allocator,
         ring: *Ring,
         slots: *slotter.BufferSlots,
-        serverFd: posix.fd_t,
+        server_fd: posix.fd_t,
         limit: u64,
     ) !void {
         self.* = Self{
@@ -291,15 +291,15 @@ const echoClientFSM = struct {
             .ring = ring,
             .slots = slots,
             .placeholder = try allocator.alloc(u8, 1024),
-            .bufRest = &[0]u8{},
+            .buf_rest = &[0]u8{},
             .critical = "",
             .reply = undefined,
-            .reqCount = 0,
-            .respCount = 0,
+            .req_count = 0,
+            .resp_count = 0,
             .state = .needSend,
             .limit = limit,
-            .serverFd = serverFd,
-            .recvArmed = false,
+            .server_fd = server_fd,
+            .recv_armed = false,
         };
     }
 
@@ -311,27 +311,27 @@ const echoClientFSM = struct {
     }
 
     fn do(self: *Self) !bool {
-        if (self.respCount == self.limit and self.state == .needRecv) {
+        if (self.resp_count == self.limit and self.state == .needRecv) {
             self.state = .needCheck;
         }
 
-        if (self.reqCount >= self.limit) {
+        if (self.req_count >= self.limit) {
             // Detect a genuine stall: only count iterations that make no
             // progress on received responses.
-            if (self.respCount == self.lastRespCount) {
-                self.iterationCounter += 1;
-                if (self.iterationCounter >= 50_000_000) {
+            if (self.resp_count == self.last_resp_count) {
+                self.iteration_counter += 1;
+                if (self.iteration_counter >= 50_000_000) {
                     return error.LoopTooMuch;
                 }
             } else {
-                self.iterationCounter = 0;
-                self.lastRespCount = self.respCount;
+                self.iteration_counter = 0;
+                self.last_resp_count = self.resp_count;
             }
         }
 
         switch (self.state) {
             .needSend => {
-                if (self.reqCount >= self.limit) {
+                if (self.req_count >= self.limit) {
                     self.state = .needCheck;
                     return false;
                 }
@@ -346,9 +346,9 @@ const echoClientFSM = struct {
                     return error.SendErrorMissingBuffer;
                 };
 
-                echoPayload.save(buffer[0..21], self.reqCount, "Hello", time.nowNs());
+                echoPayload.save(buffer[0..21], self.req_count, "Hello", time.nowNs());
 
-                self.ring.pushSend(self.serverFd, bufferIdx, buffer[0..21], 21, .{}) catch |err| {
+                self.ring.pushSend(self.server_fd, bufferIdx, buffer[0..21], 21, .{}) catch |err| {
                     if (err == error.RingFull) {
                         self.slots.del(bufferIdx);
                         std.atomic.spinLoopHint();
@@ -359,16 +359,16 @@ const echoClientFSM = struct {
                     return err;
                 };
 
-                self.reqCount += 1;
+                self.req_count += 1;
                 self.state = .needRecv;
                 return true;
             },
 
             .needCheck => {
-                if (self.bufRest.len >= 21) {
+                if (self.buf_rest.len >= 21) {
                     const seqIdx = echoPayload.getSeqIdx(self.respBody());
-                    if (seqIdx != self.respCount) {
-                        try self.setCritical("got seqId = {}, wanted {} from {any}", .{ seqIdx, self.respCount, self.respBody() });
+                    if (seqIdx != self.resp_count) {
+                        try self.setCritical("got seqId = {}, wanted {} from {any}", .{ seqIdx, self.resp_count, self.respBody() });
                         return error.ErrorUnexpectedSeqIdx;
                     }
 
@@ -385,8 +385,8 @@ const echoClientFSM = struct {
                         return error.ErrorInvalidTime;
                     }
 
-                    self.bufRest = self.bufRest[21..];
-                    self.respCount += 1;
+                    self.buf_rest = self.buf_rest[21..];
+                    self.resp_count += 1;
 
                     self.state = .needSend;
                     return true;
@@ -396,7 +396,7 @@ const echoClientFSM = struct {
                     // Do not send ahead: blasting requests without waiting for the
                     // previous send's completion floods the SQ and exhausts slots.
                     // Only make sure a receive is armed while we wait.
-                    if (!self.recvArmed) {
+                    if (!self.recv_armed) {
                         self.state = .needRecv;
                     }
                     return false;
@@ -415,22 +415,22 @@ const echoClientFSM = struct {
                     };
 
                     // Copy the data from the provided buffer into the placeholder
-                    if (self.bufRest.len > 0) {
-                        std.mem.copyForwards(u8, self.placeholder[0..self.bufRest.len], self.bufRest);
+                    if (self.buf_rest.len > 0) {
+                        std.mem.copyForwards(u8, self.placeholder[0..self.buf_rest.len], self.buf_rest);
                     }
-                    @memcpy(self.placeholder[self.bufRest.len .. self.bufRest.len + cqe.result()], buffer[0..cqe.result()]);
-                    self.bufRest = self.placeholder[0 .. self.bufRest.len + cqe.result()];
+                    @memcpy(self.placeholder[self.buf_rest.len .. self.buf_rest.len + cqe.result()], buffer[0..cqe.result()]);
+                    self.buf_rest = self.placeholder[0 .. self.buf_rest.len + cqe.result()];
 
                     self.ring.releaseBuffer(.tiny, cqe.bid());
 
-                    self.recvArmed = false;
+                    self.recv_armed = false;
                     self.state = .needCheck;
                     return true;
                 }
 
                 self.slots.del(cqe.taskIdx());
 
-                if (self.reqCount < self.limit) {
+                if (self.req_count < self.limit) {
                     self.state = .needSend;
                 } else {
                     self.state = .needRecv;
@@ -439,8 +439,8 @@ const echoClientFSM = struct {
             },
 
             .needRecv => {
-                if (!self.recvArmed) {
-                    self.ring.pushRecvZC(self.serverFd, sendIdx, .tiny, .{}) catch |err| {
+                if (!self.recv_armed) {
+                    self.ring.pushRecvZC(self.server_fd, sendIdx, .tiny, .{}) catch |err| {
                         if (err != error.RingFull) {
                             try self.setCritical("critical push error", .{});
                             return err;
@@ -448,7 +448,7 @@ const echoClientFSM = struct {
                         self.state = .needCheck;
                         return false;
                     };
-                    self.recvArmed = true;
+                    self.recv_armed = true;
                 }
 
                 self.state = .needCheck;
@@ -465,7 +465,7 @@ const echoClientFSM = struct {
             \\   state: {}
             \\ ---
             \\
-        , .{ self.reqCount, self.respCount, self.state });
+        , .{ self.req_count, self.resp_count, self.state });
         self.critical = try std.fmt.allocPrint(self.allocator, format, args);
     }
 
@@ -474,11 +474,11 @@ const echoClientFSM = struct {
     }
 
     pub fn done(self: *Self) bool {
-        return self.reqCount >= self.limit and self.respCount >= self.limit;
+        return self.req_count >= self.limit and self.resp_count >= self.limit;
     }
 
     inline fn respBody(self: *Self) []u8 {
-        return self.bufRest[0..21];
+        return self.buf_rest[0..21];
     }
 };
 
@@ -687,10 +687,10 @@ test "echo server and client" {
             state.barrier.unlock();
 
             // Push accepts until there's a client.
-            const clientFd = must("wait and accept the client", getAcceptedConn(&ring, sockFd));
+            const client_fd = must("wait and accept the client", getAcceptedConn(&ring, sockFd));
 
             var fsm: echoServerFSM = undefined;
-            must("create server fsm", fsm.init(serverArena.allocator(), &ring, &slots, clientFd, &ordbuf, noOfRequests));
+            must("create server fsm", fsm.init(serverArena.allocator(), &ring, &slots, client_fd, &ordbuf, noOfRequests));
             defer fsm.deinit();
 
             while (!fsm.done()) {
@@ -726,8 +726,8 @@ test "echo server and client" {
 
             // Connect to the server (via the socket helpers)
             const sockets = @import("sockets.zig");
-            const clientFd = must("create client socket", sockets.createTCPClientSocket(null));
-            defer _ = linux.close(clientFd);
+            const client_fd = must("create client socket", sockets.createTCPClientSocket(null));
+            defer _ = linux.close(client_fd);
 
             state.barrier.lock();
             state.barrier.unlock();
@@ -735,13 +735,13 @@ test "echo server and client" {
             const serverIp = "127.0.0.1";
             const serverPort = 60006;
 
-            must("connect to the server", ring.pushConnectIp4(clientFd, 1, serverIp, serverPort, .{}));
+            must("connect to the server", ring.pushConnectIp4(client_fd, 1, serverIp, serverPort, .{}));
             const cqe = must("wait for the connection approval", wait(&ring));
             if (cqe.res < 0) {
                 std.debug.panic("failed to connect to the server: {}", .{linux.errno(cqe.result())});
             }
             var fsm: echoClientFSM = undefined;
-            must("create client fsm", fsm.init(clientArena.allocator(), &ring, &slots, clientFd, noOfRequests));
+            must("create client fsm", fsm.init(clientArena.allocator(), &ring, &slots, client_fd, noOfRequests));
 
             const start = time.nowNs();
             while (!fsm.done()) {
@@ -1030,8 +1030,8 @@ test "batchedCQ caps the drained entries" {
     // four of them guarantee the whole burst is visible to the batch.
     var spins: usize = 0;
     while (true) : (spins += 1) {
-        const head = ring.cqHead.*;
-        const tail = @atomicLoad(u32, ring.cqTail, .acquire);
+        const head = ring.cq_head.*;
+        const tail = @atomicLoad(u32, ring.cq_tail, .acquire);
         if (tail -% head >= 4) break;
 
         if (spins % 1000 == 999) {
@@ -1195,9 +1195,9 @@ test "cancel an armed multishot accept" {
     // re-arms its poll without posting a CQE, so waiting for one would hang.
     try ring.pushAcceptMultishot(sockFd, acceptIdx, .{});
 
-    const clientFd = try sockets.createTCPClientSocket(null);
-    defer _ = linux.close(clientFd);
-    try ring.pushConnectIp4(clientFd, connectIdx, "127.0.0.1", 60016, .{});
+    const client_fd = try sockets.createTCPClientSocket(null);
+    defer _ = linux.close(client_fd);
+    try ring.pushConnectIp4(client_fd, connectIdx, "127.0.0.1", 60016, .{});
 
     // Drain the connect and the accepted connection. The accepted fd carries
     // hasMore, marking the multishot as still armed.

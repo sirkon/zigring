@@ -25,11 +25,11 @@ pub fn Slots(comptime T: type) type {
         cap: u64,
         slots: []Element,
         free: []i32,
-        firstFree: i32,
+        first_free: i32,
 
         // Fast bit magic instead of runtime division:
-        capShift: u6, // Stores log2(fallback_cap) for the >> shift
-        capMask: u64, // Stores (fallback_cap - 1) for the & mask
+        cap_shift: u6, // Stores log2(fallback_cap) for the >> shift
+        cap_mask: u64, // Stores (fallback_cap - 1) for the & mask
 
         children: ?[]?*Self, // Array of N child slotters
 
@@ -73,10 +73,10 @@ pub fn Slots(comptime T: type) type {
                 .cap = capacity,
                 .slots = slots,
                 .free = free,
-                .firstFree = 0,
+                .first_free = 0,
                 // Compute the parameters for the bit magic in 1 cycle:
-                .capShift = @intCast(@ctz(capacity)),
-                .capMask = capacity - 1,
+                .cap_shift = @intCast(@ctz(capacity)),
+                .cap_mask = capacity - 1,
                 .children = children,
             };
         }
@@ -110,9 +110,9 @@ pub fn Slots(comptime T: type) type {
         /// from creating a child propagate out as well.
         pub fn add(self: *Self, v: T) !u64 {
             // Fast path: take from the original slotter
-            if (self.firstFree >= 0) {
-                const free_idx = @as(usize, @intCast(self.firstFree));
-                self.firstFree = self.free[free_idx];
+            if (self.first_free >= 0) {
+                const free_idx = @as(usize, @intCast(self.first_free));
+                self.first_free = self.free[free_idx];
 
                 self.slots[free_idx] = .{
                     .value = v,
@@ -164,8 +164,8 @@ pub fn Slots(comptime T: type) type {
                 const offset = idx - self.cap;
 
                 // Here it is, the magic without heavy division:
-                const childI = offset >> self.capShift; // Shift instead of '/'
-                const childrenLocalIdx = offset & self.capMask; // Mask instead of '%'
+                const childI = offset >> self.cap_shift; // Shift instead of '/'
+                const childrenLocalIdx = offset & self.cap_mask; // Mask instead of '%'
 
                 if (childI < childrenSlice.len) {
                     if (childrenSlice[childI]) |child| {
@@ -184,8 +184,8 @@ pub fn Slots(comptime T: type) type {
         pub fn del(self: *Self, idx: u64) void {
             if (idx < self.cap) {
                 self.slots[idx] = .{ .value = undefined, .exists = false };
-                self.free[idx] = self.firstFree;
-                self.firstFree = @intCast(idx);
+                self.free[idx] = self.first_free;
+                self.first_free = @intCast(idx);
                 return;
             }
 
@@ -193,8 +193,8 @@ pub fn Slots(comptime T: type) type {
                 const offset = idx - self.cap;
 
                 // And here it also flies in 1 cycle:
-                const childI = offset >> self.capShift;
-                const childLocalIdx = offset & self.capMask;
+                const childI = offset >> self.cap_shift;
+                const childLocalIdx = offset & self.cap_mask;
 
                 if (childI < childrenSlice.len) {
                     if (childrenSlice[childI]) |child| {
@@ -250,34 +250,34 @@ pub fn Slots(comptime T: type) type {
 /// An index allocator whose slots are fixed-size byte buffers.
 ///
 /// Like `Slots(T)` it hands out dense `u64` indices, but each index maps to an
-/// `elementSize`-byte slice of one large backing allocation. A root table of
+/// `element_size`-byte slice of one large backing allocation. A root table of
 /// `capacity` buffers is allocated up front, and up to `childCount` child
 /// tables are grown lazily, giving `capacity * (1 + childCount)` slots in
 /// total.
 ///
-/// `capacity` must be a power of two and at least 4096, and `elementSize` must
+/// `capacity` must be a power of two and at least 4096, and `element_size` must
 /// be non-zero. Buffers are never zeroed when a slot is reused.
 pub const BufferSlots = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    elementSize: u64,
+    element_size: u64,
     cap: u64,
 
     buf: []u8,
     exists: []bool,
     free: []i32,
-    firstFree: i32,
+    first_free: i32,
 
-    capShift: u6,
-    capMask: u64,
+    cap_shift: u6,
+    cap_mask: u64,
 
     children: ?[]?*Self,
 
-    /// Allocates `capacity * elementSize` bytes of backing storage plus the
+    /// Allocates `capacity * element_size` bytes of backing storage plus the
     /// bookkeeping arrays, and `childCount` lazily-filled child pointers.
     ///
-    /// `capacity` must be a power of two of at least 4096, and `elementSize`
+    /// `capacity` must be a power of two of at least 4096, and `element_size`
     /// must be non-zero (see the corresponding errors). The backing allocation
     /// is owned by the slotter and freed by `deinit`; the allocator must
     /// outlive the slotter. `self` must point at storage that outlives the
@@ -286,15 +286,15 @@ pub const BufferSlots = struct {
         self: *Self,
         allocator: std.mem.Allocator,
         capacity: u64,
-        elementSize: u64,
+        element_size: u64,
         childCount: usize,
     ) !void {
         if (capacity == 0 or (capacity & (capacity - 1)) != 0) return error.CapacityMustBePowerOfTwo;
 
         if (capacity < 4096) return error.CapacityTooSmall;
-        if (elementSize == 0) return error.ElementSizeCannotBeZero;
+        if (element_size == 0) return error.ElementSizeCannotBeZero;
 
-        const buf = try allocator.alloc(u8, capacity * elementSize);
+        const buf = try allocator.alloc(u8, capacity * element_size);
         errdefer allocator.free(buf);
 
         const exists = try allocator.alloc(bool, capacity);
@@ -317,14 +317,14 @@ pub const BufferSlots = struct {
 
         self.* = .{
             .allocator = allocator,
-            .elementSize = elementSize,
+            .element_size = element_size,
             .cap = capacity,
             .buf = buf,
             .exists = exists,
             .free = free,
-            .firstFree = 0,
-            .capShift = @intCast(@ctz(capacity)),
-            .capMask = capacity - 1,
+            .first_free = 0,
+            .cap_shift = @intCast(@ctz(capacity)),
+            .cap_mask = capacity - 1,
             .children = children,
         };
     }
@@ -350,7 +350,7 @@ pub const BufferSlots = struct {
     }
 
     /// Result of `addSlot`: the global index of the reserved slot and a
-    /// borrowed, uninitialized slice of `elementSize` bytes to write into.
+    /// borrowed, uninitialized slice of `element_size` bytes to write into.
     pub const AddResult = struct { idx: u64, slice: []u8 };
 
     /// Reserves a free slot and returns its index together with a borrowed
@@ -362,12 +362,12 @@ pub const BufferSlots = struct {
     /// table when the root is full, and returns `error.NoFreeSlots` when every
     /// table is full.
     pub fn addSlot(self: *Self) !AddResult {
-        if (self.firstFree >= 0) {
-            const freeIdx = @as(usize, @intCast(self.firstFree));
-            self.firstFree = self.free[freeIdx];
+        if (self.first_free >= 0) {
+            const freeIdx = @as(usize, @intCast(self.first_free));
+            self.first_free = self.free[freeIdx];
 
-            const start = freeIdx * self.elementSize;
-            const end = start + self.elementSize;
+            const start = freeIdx * self.element_size;
+            const end = start + self.element_size;
 
             self.exists[freeIdx] = true;
 
@@ -383,7 +383,7 @@ pub const BufferSlots = struct {
                     const childPtr = try self.allocator.create(Self);
                     errdefer self.allocator.destroy(childPtr);
 
-                    try childPtr.init(self.allocator, self.cap, self.elementSize, 0);
+                    try childPtr.init(self.allocator, self.cap, self.element_size, 0);
                     childrenSlice[i] = childPtr;
                 }
 
@@ -413,7 +413,7 @@ pub const BufferSlots = struct {
         return res.idx;
     }
 
-    /// Returns the borrowed `elementSize`-byte slice stored at `idx`, or null
+    /// Returns the borrowed `element_size`-byte slice stored at `idx`, or null
     /// if the index is out of range or not currently allocated.
     ///
     /// The slice aliases the slotter's backing memory: mutate it freely, but do
@@ -422,15 +422,15 @@ pub const BufferSlots = struct {
     pub fn get(self: Self, idx: u64) ?[]u8 {
         if (idx < self.cap) {
             if (!self.exists[idx]) return null;
-            const start = idx * self.elementSize;
-            const end = start + self.elementSize;
+            const start = idx * self.element_size;
+            const end = start + self.element_size;
             return self.buf[start..end];
         }
 
         if (self.children) |childrenSlice| {
             const offset = idx - self.cap;
-            const childI = offset >> self.capShift;
-            const childLocalIdx = offset & self.capMask;
+            const childI = offset >> self.cap_shift;
+            const childLocalIdx = offset & self.cap_mask;
 
             if (childI < childrenSlice.len) {
                 if (childrenSlice[childI]) |child| {
@@ -454,15 +454,15 @@ pub const BufferSlots = struct {
             if (!self.exists[idx]) return;
 
             self.exists[idx] = false;
-            self.free[idx] = self.firstFree;
-            self.firstFree = @intCast(idx);
+            self.free[idx] = self.first_free;
+            self.first_free = @intCast(idx);
             return;
         }
 
         if (self.children) |childrenSlice| {
             const offset = idx - self.cap;
-            const childI = offset >> self.capShift;
-            const childLocalIdx = offset & self.capMask;
+            const childI = offset >> self.cap_shift;
+            const childLocalIdx = offset & self.cap_mask;
 
             if (childI < childrenSlice.len) {
                 if (childrenSlice[childI]) |child| {

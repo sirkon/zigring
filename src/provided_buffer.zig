@@ -43,43 +43,43 @@ pub const ProvidedBufferPool = struct {
 
     const MMapError = posix.MMapError;
 
-    notInitalized: bool,
+    not_initalized: bool,
 
-    ringFd: posix.fd_t,
+    ring_fd: posix.fd_t,
     bgid: u16,
 
     // Memory of the buffer control ring.
-    bufRing: *io_uring_buf_ring,
-    bufRingEntries: u32,
+    buf_ring: *io_uring_buf_ring,
+    buf_ring_entries: u32,
 
     // A big chunk of memory carved into buffers.
-    memoryBacking: []u8,
-    bufferSize: u32,
+    memory_backing: []u8,
+    buffer_size: u32,
 
     // Raw mmap slices, saved for cleanup in deinit. The ring slice
     // covers the rounded-up mapping, so munmap can release it whole.
-    bufRingMmap: []align(std.heap.page_size_min) u8,
-    memoryBackingMmap: []align(std.heap.page_size_min) u8,
+    buf_ring_mmap: []align(std.heap.page_size_min) u8,
+    memory_backing_mmap: []align(std.heap.page_size_min) u8,
 
     /// Marks `self` as not yet initialized, so `deinit`, `releaseBuffer`,
     /// `buffer` and `replenishAll` all become harmless no-ops. Used to fill
     /// the ring's pool slots before any pool is registered.
     pub fn initUninitialized(self: *Self) void {
-        self.notInitalized = true;
+        self.not_initalized = true;
     }
 
     /// Registers a kernel-provided buffer ring for `entries` buffers of
-    /// `bufferSize` bytes in place, on ring fd `ringFd` under group id `bgid`.
+    /// `buffer_size` bytes in place, on ring fd `ring_fd` under group id `bgid`.
     ///
     /// `entries` must be a power of two and the element array must be at least
     /// 32 bytes, else `error.EntriesMustBePowerOf2` or
     /// `error.BufferRingTooSmall`. On any failure `self` is left untouched.
     pub fn init(
         self: *Self,
-        ringFd: posix.fd_t,
+        ring_fd: posix.fd_t,
         bgid: u16,
         entries: u32,
-        bufferSize: u32,
+        buffer_size: u32,
     ) !void {
         // Protect indices against non power-of-two rings.
         if (@popCount(entries) != 1) return error.EntriesMustBePowerOf2;
@@ -91,23 +91,23 @@ pub const ProvidedBufferPool = struct {
         const ringSize = try mmapRing(entries);
         errdefer posix.munmap(ringSize);
 
-        const backingSize = try mmapBacking(entries, bufferSize);
+        const backingSize = try mmapBacking(entries, buffer_size);
         errdefer posix.munmap(backingSize);
 
-        const bufRing: *io_uring_buf_ring = @ptrCast(ringSize.ptr);
+        const buf_ring: *io_uring_buf_ring = @ptrCast(ringSize.ptr);
 
         // Register the ring in the kernel by explicit opcode 22
         // (IORING_REGISTER_PBUF_RING). The IORING_REGISTER enum ordering
         // is not stable, so it is deliberately not used.
         var reg = std.mem.zeroes(linux.io_uring_buf_reg);
-        reg.ring_addr = @intFromPtr(bufRing);
+        reg.ring_addr = @intFromPtr(buf_ring);
         reg.ring_entries = entries;
         reg.bgid = bgid;
 
         const IORING_REGISTER_PBUF_RING = 22;
         const res = linux.syscall4(
             .io_uring_register,
-            @intCast(ringFd),
+            @intCast(ring_fd),
             IORING_REGISTER_PBUF_RING,
             @intFromPtr(&reg),
             1,
@@ -117,15 +117,15 @@ pub const ProvidedBufferPool = struct {
         }
 
         self.* = .{
-            .notInitalized = false,
-            .ringFd = ringFd,
+            .not_initalized = false,
+            .ring_fd = ring_fd,
             .bgid = bgid,
-            .bufRing = bufRing,
-            .bufRingEntries = entries,
-            .memoryBacking = backingSize[0 .. @as(usize, entries) * bufferSize],
-            .bufferSize = bufferSize,
-            .bufRingMmap = ringSize,
-            .memoryBackingMmap = backingSize,
+            .buf_ring = buf_ring,
+            .buf_ring_entries = entries,
+            .memory_backing = backingSize[0 .. @as(usize, entries) * buffer_size],
+            .buffer_size = buffer_size,
+            .buf_ring_mmap = ringSize,
+            .memory_backing_mmap = backingSize,
         };
 
         // Publish every buffer to the kernel before the ring is handed back,
@@ -134,12 +134,12 @@ pub const ProvidedBufferPool = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.notInitalized) {
+        if (self.not_initalized) {
             return;
         }
 
-        posix.munmap(self.bufRingMmap);
-        posix.munmap(self.memoryBackingMmap);
+        posix.munmap(self.buf_ring_mmap);
+        posix.munmap(self.memory_backing_mmap);
         self.* = undefined;
     }
 
@@ -151,8 +151,8 @@ pub const ProvidedBufferPool = struct {
     }
 
     /// Map the data backing of all buffers.
-    fn mmapBacking(entries: u32, bufferSize: u32) MMapError![]align(std.heap.pageSize()) u8 {
-        const rawDataSize = @as(usize, entries) * bufferSize;
+    fn mmapBacking(entries: u32, buffer_size: u32) MMapError![]align(std.heap.pageSize()) u8 {
+        const rawDataSize = @as(usize, entries) * buffer_size;
         return mmapPool(rawDataSize);
     }
 
@@ -192,27 +192,27 @@ pub const ProvidedBufferPool = struct {
         return hugeMap;
     }
 
-    /// Cut `memoryBacking` into buffers and map them all into the ring.
+    /// Cut `memory_backing` into buffers and map them all into the ring.
     fn replenishAll(self: *Self) void {
-        if (self.notInitalized) {
+        if (self.not_initalized) {
             return;
         }
 
-        const mask = self.bufRingEntries - 1;
-        const tail = @atomicLoad(u16, &self.bufRing.tail, .acquire);
+        const mask = self.buf_ring_entries - 1;
+        const tail = @atomicLoad(u16, &self.buf_ring.tail, .acquire);
 
         // The element array sits strictly after the io_uring_buf_ring header.
-        const basePtr = @intFromPtr(self.bufRing) + bufsOffset;
+        const basePtr = @intFromPtr(self.buf_ring) + bufsOffset;
         const bufsPtr: [*]linux.io_uring_buf = @ptrFromInt(basePtr);
 
         var i: u32 = 0;
-        while (i < self.bufRingEntries) : (i += 1) {
+        while (i < self.buf_ring_entries) : (i += 1) {
             const slotIdx = (tail + i) & mask;
-            const offset = @as(usize, i) * self.bufferSize;
+            const offset = @as(usize, i) * self.buffer_size;
 
             bufsPtr[slotIdx] = .{
-                .addr = @intFromPtr(self.memoryBacking.ptr + offset),
-                .len = self.bufferSize,
+                .addr = @intFromPtr(self.memory_backing.ptr + offset),
+                .len = self.buffer_size,
                 .bid = @intCast(i),
                 .resv = 0,
             };
@@ -221,62 +221,62 @@ pub const ProvidedBufferPool = struct {
         // Publish the new tail so the SQPOLL kernel thread can consume
         // the freshly added buffers. .release ordering guarantees the
         // element writes are visible before the tail update.
-        const newTail = tail +% @as(u16, @intCast(self.bufRingEntries));
-        @atomicStore(u16, &self.bufRing.tail, newTail, .release);
+        const newTail = tail +% @as(u16, @intCast(self.buf_ring_entries));
+        @atomicStore(u16, &self.buf_ring.tail, newTail, .release);
     }
 
     /// Return a single processed buffer (identified by its id) back to
     /// the ring at the current tail index.
     pub fn releaseBuffer(self: *Self, bid: u16) void {
-        if (self.notInitalized) {
+        if (self.not_initalized) {
             @branchHint(.cold);
             return;
         }
         const idx = @as(usize, bid);
-        if (idx >= self.bufRingEntries) {
+        if (idx >= self.buf_ring_entries) {
             @branchHint(.cold);
             return;
         }
 
-        const mask = self.bufRingEntries - 1;
+        const mask = self.buf_ring_entries - 1;
 
         // The tail is only written by our userspace thread.
-        const tail = @atomicLoad(u16, &self.bufRing.tail, .acquire);
+        const tail = @atomicLoad(u16, &self.buf_ring.tail, .acquire);
 
-        const basePtr = @intFromPtr(self.bufRing) + bufsOffset;
+        const basePtr = @intFromPtr(self.buf_ring) + bufsOffset;
         const bufsPtr: [*]linux.io_uring_buf = @ptrFromInt(basePtr);
 
         const slotIdx = tail & mask;
-        const offset = idx * self.bufferSize;
+        const offset = idx * self.buffer_size;
 
         bufsPtr[slotIdx] = .{
-            .addr = @intFromPtr(self.memoryBacking.ptr + offset),
-            .len = self.bufferSize,
+            .addr = @intFromPtr(self.memory_backing.ptr + offset),
+            .len = self.buffer_size,
             .bid = bid,
             .resv = 0,
         };
 
-        @atomicStore(u16, &self.bufRing.tail, tail +% 1, .release);
+        @atomicStore(u16, &self.buf_ring.tail, tail +% 1, .release);
     }
 
     /// Return buffer slice for the given idx.
     pub fn buffer(self: *Self, bid: u16) ![]u8 {
-        if (self.notInitalized) {
+        if (self.not_initalized) {
             @branchHint(.cold);
             return error.SizeClassNotInitialized;
         }
         const idx = @as(usize, bid);
-        if (idx >= self.bufRingEntries) {
+        if (idx >= self.buf_ring_entries) {
             @branchHint(.cold);
             return error.InvalidBufferIndex;
         }
 
-        const offset = idx * self.bufferSize;
-        return self.memoryBacking[offset .. offset + self.bufferSize];
+        const offset = idx * self.buffer_size;
+        return self.memory_backing[offset .. offset + self.buffer_size];
     }
 
     /// Checks if this buffer pool is initialized.
     pub fn isInactive(self: *Self) bool {
-        return self.notInitalized;
+        return self.not_initalized;
     }
 };

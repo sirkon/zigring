@@ -26,7 +26,7 @@ pub const Ring = ring.Ring;
 
 /// A thread-safe factory that hands out rings.
 ///
-/// It spreads rings across at most `maxPollerThreads` kernel pollers, attaching
+/// It spreads rings across at most `max_poller_threads` kernel pollers, attaching
 /// new rings to an existing poller with `IORING_SETUP_ATTACH_WQ` to cap the
 /// number of polling threads.
 pub const Factory = factory.Factory;
@@ -83,7 +83,7 @@ pub const Slots = slotter.Slots;
 
 /// A dense, growable index allocator over fixed-size byte buffers.
 ///
-/// Each index maps to an `elementSize`-byte slice of one backing allocation,
+/// Each index maps to an `element_size`-byte slice of one backing allocation,
 /// handed out without copying so callers can write in place.
 pub const BufferSlots = slotter.BufferSlots;
 
